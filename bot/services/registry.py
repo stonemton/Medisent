@@ -14,12 +14,15 @@ from typing import Any
 from bot.config import get_settings
 from bot.db.models import RegistryState
 from bot.logging_setup import log_extra
-from bot.services import registry_endpoints as endpoints
+from bot.services import pricing, registry_endpoints as endpoints
 from bot.services.http import ApiClient
 from bot.services.registry_endpoints import RegistryRecord
 
 logger = logging.getLogger(__name__)
 Outcome = tuple[list[RegistryRecord], str | None]
+
+FIRECRAWL_SEARCH_URL = "https://api.firecrawl.dev/v2/search"
+ELK_CARD_RE = re.compile(r"^https://elk\.roszdravnadzor\.gov\.ru/widget/med-product/(\d+)(?:[/?#].*)?$", re.I)
 
 
 def derive_state(outcomes: Sequence[Outcome]) -> str:
@@ -88,7 +91,6 @@ def _significant_terms(text: str) -> list[str]:
 
 
 def _record_matches_query(record: RegistryRecord, query: str) -> bool:
-    """Отбрасывает таблицы/служебные строки unrega, не относящиеся к изделию."""
     terms = _significant_terms(query)
     if not terms:
         return False
@@ -102,9 +104,70 @@ def _record_matches_query(record: RegistryRecord, query: str) -> bool:
         )
     ).lower()
     hits = sum(1 for term in set(terms) if term in haystack)
-    # Для короткого конкретного запроса достаточно одного сильного совпадения,
-    # для длинного требуем минимум два, чтобы шапка таблицы не считалась письмом.
     return hits >= (1 if len(set(terms)) <= 2 else 2)
+
+
+def _clean_md_value(value: str | None) -> str | None:
+    if not value:
+        return None
+    value = re.sub(r"^[#>*_`\-\s]+|[#>*_`\s]+$", "", value).strip()
+    return value or None
+
+
+def _field_after_label(text: str, *labels: str) -> str | None:
+    """Берёт значение после подписи поля на официальной карточке ELK."""
+    for label in labels:
+        escaped = re.escape(label)
+        patterns = (
+            rf"(?im)^\s*(?:[#>*_`-]+\s*)?{escaped}\s*(?:[*_`]*)\s*$\n+\s*([^\n]+)",
+            rf"(?im)^\s*(?:[#>*_`-]+\s*)?{escaped}\s*[:—-]\s*([^\n]+)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return _clean_md_value(match.group(1))
+    return None
+
+
+def _parse_elk_card_text(text: str, url: str, query: str) -> RegistryRecord | None:
+    ru_number = _field_after_label(
+        text,
+        "Регистрационный номер медицинского изделия",
+        "Номер ЕРУЛ",
+    )
+    product_name = _field_after_label(text, "Наименование медицинского изделия")
+    status_text = _field_after_label(text, "Статус")
+    holder = _field_after_label(
+        text,
+        "Наименования организации - уполномоченного представителя производителя (изготовителя) медицинского изделия",
+        "Наименование организации - уполномоченного представителя производителя (изготовителя) медицинского изделия",
+        "Наименования организации - производителя медицинского изделия или организации - изготовителя медицинского изделия",
+        "Наименование организации - производителя медицинского изделия или организации - изготовителя медицинского изделия",
+    )
+
+    if not ru_number and not product_name:
+        return None
+
+    lowered = (status_text or "").lower()
+    valid: bool | None
+    if any(marker in lowered for marker in ("аннулир", "прекращ", "приостанов", "недейств", "отмен")):
+        valid = False
+    elif "действ" in lowered:
+        valid = True
+    else:
+        valid = None
+
+    record = RegistryRecord(
+        registry="elk",
+        ru_number=ru_number,
+        holder=holder,
+        product_name=product_name,
+        valid=valid,
+        status_text=status_text,
+        card_url=url,
+        raw={"source": "official_elk_page", "text": text[:10000]},
+    )
+    return record if _record_matches_query(record, query) else None
 
 
 class RegistryService:
@@ -119,26 +182,93 @@ class RegistryService:
                 "User-Agent": "Medisent-Bot/0.1 (medical device procurement)",
             },
         )
+        self._firecrawl = ApiClient(
+            "firecrawl",
+            headers={
+                "Authorization": f"Bearer {settings.firecrawl_api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout_read=120.0,
+        )
 
     async def aclose(self) -> None:
         await self._client.aclose()
+        await self._firecrawl.aclose()
 
     async def _check_elk(
         self, name: str | None, ru_number: str | None, request_id: int | None
     ) -> tuple[list[RegistryRecord], str | None]:
-        url = self._settings.registry_elk_base.rstrip("/") + endpoints.ELK_SEARCH_PATH
-        result = await self._client.post(
-            url,
-            operation="elk.search",
+        """Проверяет РУ по официальным публичным карточкам ELK.
+
+        Внутренний JSON endpoint ELK не документирован и изменился: старый путь
+        отвечает 404. Поэтому поиск карточки делает Firecrawl Search, но запись
+        принимается только если URL принадлежит официальному ELK и данные РУ
+        извлечены из содержимого самой официальной карточки. Ответ поисковика сам
+        по себе доказательством регистрации не считается.
+        """
+        if not self._settings.firecrawl_api_key:
+            return [], "для проверки официальных карточек ELK нужен FIRECRAWL_API_KEY"
+
+        query = (ru_number or name or "").strip()
+        if not query:
+            return [], "пустой запрос к ELK"
+
+        result = await self._firecrawl.post(
+            FIRECRAWL_SEARCH_URL,
+            operation="elk.official_search",
             request_id=request_id,
-            json=endpoints.build_elk_query(name=name, ru_number=ru_number),
+            cost_usd=pricing.flat_cost("firecrawl"),
+            json={
+                "query": f'"{query}" inurl:/widget/med-product/',
+                "limit": 8,
+                "sources": ["web"],
+                "includeDomains": ["elk.roszdravnadzor.gov.ru"],
+                "country": "RU",
+                "timeout": 60000,
+                "ignoreInvalidURLs": True,
+                "scrapeOptions": {
+                    "formats": [{"type": "markdown"}],
+                    "onlyMainContent": True,
+                },
+            },
         )
         if not result.ok:
-            return [], result.error or "gateway elk недоступен"
-        outcome = endpoints.parse_elk_payload(result.json)
-        if not outcome.understood:
-            return [], f"ответ elk не разобран: {outcome.note}"
-        return outcome.records, None
+            return [], result.error or "поиск официальных карточек ELK недоступен"
+
+        payload = result.json or {}
+        data = payload.get("data") or {}
+        rows = data.get("web") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return [], "Firecrawl не вернул список официальных карточек ELK"
+
+        records: list[RegistryRecord] = []
+        seen_urls: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            url = str(row.get("url") or "").strip()
+            if not ELK_CARD_RE.match(url) or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            text = "\n".join(
+                str(row.get(key) or "") for key in ("title", "description", "markdown")
+            )
+            record = _parse_elk_card_text(text, url, query)
+            if record is not None:
+                records.append(record)
+
+        if records:
+            logger.info(
+                "ELK: по «%s» подтверждено официальных карточек %s",
+                query,
+                len(records),
+                extra=log_extra(request_id),
+            )
+            return records, None
+
+        # Нулевой результат поискового индекса не равен официальному «не найдено».
+        # Поэтому не занижаем достоверность: возвращаем unavailable.
+        return [], "официальная карточка ELK не найдена или её поля не удалось подтвердить"
 
     async def _check_misearch(
         self, name: str | None, ru_number: str | None, request_id: int | None
@@ -214,8 +344,6 @@ class RegistryService:
         if mi_error:
             errors["misearch"] = mi_error
 
-        # ELK — текущий основной реестр. Если он дал понятный ответ, старый
-        # misearch не имеет права превращать результат обратно в unavailable.
         if records:
             state = RegistryState.FOUND
         elif elk_error is None:
@@ -246,8 +374,6 @@ class RegistryService:
         extra = log_extra(request_id)
         query = f"{name} {holder}".strip() if holder else name
 
-        # Не отправляем в реестр бессодержательные фразы вроде
-        # «напиши наименование изделий»: они давали ложные совпадения с шапкой.
         if not _significant_terms(query):
             logger.info("unrega: запрос «%s» слишком общий — пропускаю", query, extra=extra)
             return RegistryResult(state=RegistryState.NOT_FOUND, records=[])

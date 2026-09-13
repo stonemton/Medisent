@@ -2,13 +2,6 @@
 
 Для основной товарной линии используем подтверждённые карточки ELK ООО
 «ГЕМАТОЛОГ». Совпадающее изделие другого держателя сохраняем как альтернативу.
-
-Точные RU-поиски дедуплицируются даже при параллельной обработке batch. Для
-ФСР 2009/06043 дополнительно есть один дедуплицированный поиск по полному
-официальному семейству ООО «Медиклон»: ELK иногда возвращает по номеру РУ
-несколько нерелевантных карточек и текущий scraper не извлекает нужную запись.
-Альтернатива принимается только если карточка одновременно подтверждает номер
-РУ и держателя «Медиклон».
 """
 from __future__ import annotations
 
@@ -23,21 +16,14 @@ from bot.logging_setup import log_extra
 from bot.services.registry_endpoints import RegistryRecord
 
 logger = logging.getLogger(__name__)
-
 _ORIGINAL_CHECK: Callable[..., Awaitable[tuple[list[RegistryRecord], str | None]]] | None = None
 
-_PACKAGING_RE = re.compile(
-    r"\b(?:\d+\s*[xх×]\s*)?\d+(?:[.,]\d+)?\s*(?:мл|ml|фл\.?|флак\.?|флакон(?:а|ов)?|шт\.?)\b",
-    re.IGNORECASE,
-)
-_NOISE_RE = re.compile(
-    r"\b(?:жидк(?:ий|ая|ое)|готов(?:ый|ая|ое)|реагент|диагностическ(?:ий|ая|ое))\b",
-    re.IGNORECASE,
-)
+_PACKAGING_RE = re.compile(r"\b(?:\d+\s*[xх×]\s*)?\d+(?:[.,]\d+)?\s*(?:мл|ml|фл\.?|флак\.?|флакон(?:а|ов)?|шт\.?)\b", re.IGNORECASE)
+_NOISE_RE = re.compile(r"\b(?:жидк(?:ий|ая|ое)|готов(?:ый|ая|ое)|реагент|диагностическ(?:ий|ая|ое))\b", re.IGNORECASE)
 _SPACE_RE = re.compile(r"\s+")
 
 _GEMATOLOG_ABO_RU = "ФСР 2008/04007"
-_GEMATOLOG_RH_KELL_KIDD_RU = "ФСР 2012/12983"
+_GEMATOLOG_ANTI_D_SUPER_RU = "ФСР 2009/05552"
 _MEDIKLON_ABO_RH_KELL_RU = "ФСР 2009/06043"
 _MEDIKLON_FAMILY_QUERY = (
     "Набор реагентов для определения групп крови человека систем АВО, Резус и Kell "
@@ -50,8 +36,7 @@ def _compact_name(name: str) -> str:
     value = _PACKAGING_RE.sub(" ", value)
     value = _NOISE_RE.sub(" ", value)
     value = re.sub(r"[(),.;:]+", " ", value)
-    value = _SPACE_RE.sub(" ", value).strip(" -–—")
-    return value
+    return _SPACE_RE.sub(" ", value).strip(" -–—")
 
 
 def _antigen_kind(name: str) -> str | None:
@@ -68,21 +53,13 @@ def _antigen_kind(name: str) -> str | None:
 
 
 def _record_text(record: RegistryRecord) -> str:
-    raw_text = ""
-    if isinstance(record.raw, dict):
-        raw_text = str(record.raw.get("text") or "")
-    return " ".join(
-        str(x or "") for x in (record.product_name, record.holder, record.ru_number, raw_text)
-    ).lower().replace("anti–", "anti-").replace("anti—", "anti-")
+    raw_text = str(record.raw.get("text") or "") if isinstance(record.raw, dict) else ""
+    return " ".join(str(x or "") for x in (record.product_name, record.holder, record.ru_number, raw_text)).lower().replace("anti–", "anti-").replace("anti—", "anti-")
 
 
 def _antigen_matches(kind: str, record: RegistryRecord) -> bool:
     haystack = _record_text(record)
-    expected = {
-        "a": ("анти-а", "anti-a"),
-        "b": ("анти-в", "anti-b", "анти-b"),
-        "d": ("анти-d", "anti-d", "rho(d)", "rhod"),
-    }[kind]
+    expected = {"a": ("анти-а", "anti-a"), "b": ("анти-в", "anti-b", "анти-b"), "d": ("анти-d", "anti-d", "rho(d)", "rhod")}[kind]
     return any(token in haystack for token in expected)
 
 
@@ -98,32 +75,20 @@ def _ru_matches(record: RegistryRecord, expected: str) -> bool:
 
 
 def _alternative_payload(record: RegistryRecord) -> dict[str, Any]:
-    return {
-        "ru_number": record.ru_number,
-        "holder": record.holder,
-        "product_name": record.product_name,
-        "valid": record.valid,
-        "card_url": record.card_url,
-    }
+    return {"ru_number": record.ru_number, "holder": record.holder, "product_name": record.product_name, "valid": record.valid, "card_url": record.card_url}
 
 
-def _attach_alternatives(
-    records: list[RegistryRecord], alternatives: list[RegistryRecord]
-) -> list[RegistryRecord]:
+def _attach_alternatives(records: list[RegistryRecord], alternatives: list[RegistryRecord]) -> list[RegistryRecord]:
     if not alternatives:
         return records
     payloads: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for alt in alternatives:
-        key = (
-            str(alt.ru_number or "").strip().lower(),
-            str(alt.holder or "").strip().lower(),
-        )
+        key = (str(alt.ru_number or "").strip().lower(), str(alt.holder or "").strip().lower())
         if key in seen:
             continue
         seen.add(key)
         payloads.append(_alternative_payload(alt))
-
     attached: list[RegistryRecord] = []
     for record in records:
         raw = dict(record.raw) if isinstance(record.raw, dict) else {}
@@ -133,28 +98,21 @@ def _attach_alternatives(
 
 
 def install_registry_query_fallbacks() -> None:
-    """Один раз добавляет точный fallback к RegistryService._check_elk."""
     global _ORIGINAL_CHECK
     if _ORIGINAL_CHECK is not None:
         return
-
     from bot.services.registry import RegistryService
-
     _ORIGINAL_CHECK = RegistryService._check_elk
     original_check = _ORIGINAL_CHECK
-
     exact_cache: dict[str, tuple[list[RegistryRecord], str | None]] = {}
     exact_inflight: dict[str, asyncio.Task[tuple[list[RegistryRecord], str | None]]] = {}
     family_cache: tuple[list[RegistryRecord], str | None] | None = None
     family_inflight: asyncio.Task[tuple[list[RegistryRecord], str | None]] | None = None
 
-    async def exact_ru(
-        self: RegistryService, ru: str, request_id: int | None
-    ) -> tuple[list[RegistryRecord], str | None]:
+    async def exact_ru(self: RegistryService, ru: str, request_id: int | None) -> tuple[list[RegistryRecord], str | None]:
         cached = exact_cache.get(ru)
         if cached is not None:
             return cached
-
         task = exact_inflight.get(ru)
         if task is None:
             task = asyncio.create_task(original_check(self, None, ru, request_id))
@@ -164,21 +122,16 @@ def install_registry_query_fallbacks() -> None:
         finally:
             if exact_inflight.get(ru) is task and task.done():
                 exact_inflight.pop(ru, None)
-
         if result[0]:
             exact_cache[ru] = result
         return result
 
-    async def mediclone_family(
-        self: RegistryService, request_id: int | None
-    ) -> tuple[list[RegistryRecord], str | None]:
+    async def mediclone_family(self: RegistryService, request_id: int | None) -> tuple[list[RegistryRecord], str | None]:
         nonlocal family_cache, family_inflight
         if family_cache is not None:
             return family_cache
         if family_inflight is None:
-            family_inflight = asyncio.create_task(
-                original_check(self, _MEDIKLON_FAMILY_QUERY, None, request_id)
-            )
+            family_inflight = asyncio.create_task(original_check(self, _MEDIKLON_FAMILY_QUERY, None, request_id))
         task = family_inflight
         try:
             result = await task
@@ -189,71 +142,29 @@ def install_registry_query_fallbacks() -> None:
             family_cache = result
         return result
 
-    async def _check_elk_with_fallbacks(
-        self: RegistryService,
-        name: str | None,
-        ru_number: str | None,
-        request_id: int | None,
-    ) -> tuple[list[RegistryRecord], str | None]:
+    async def _check_elk_with_fallbacks(self: RegistryService, name: str | None, ru_number: str | None, request_id: int | None) -> tuple[list[RegistryRecord], str | None]:
         if ru_number or not name:
             return await original_check(self, name, ru_number, request_id)
-
         kind = _antigen_kind(name)
         if kind is None:
             return await original_check(self, name, ru_number, request_id)
 
-        primary_ru = _GEMATOLOG_ABO_RU if kind in {"a", "b"} else _GEMATOLOG_RH_KELL_KIDD_RU
-
+        primary_ru = _GEMATOLOG_ABO_RU if kind in {"a", "b"} else _GEMATOLOG_ANTI_D_SUPER_RU
         (primary_records, primary_error), (alt_records, alt_error) = await asyncio.gather(
-            exact_ru(self, primary_ru, request_id),
-            exact_ru(self, _MEDIKLON_ABO_RH_KELL_RU, request_id),
+            exact_ru(self, primary_ru, request_id), exact_ru(self, _MEDIKLON_ABO_RH_KELL_RU, request_id)
         )
-
-        primary = [
-            record for record in primary_records
-            if _holder_matches(record, "гематолог") and _antigen_matches(kind, record)
-        ]
-        alternatives = [
-            record for record in alt_records
-            if _ru_matches(record, _MEDIKLON_ABO_RH_KELL_RU)
-            and _holder_matches(record, "медиклон")
-            and _antigen_matches(kind, record)
-        ]
-
-        # ELK search by exact RU can return several unrelated card links. If the
-        # Mediclone card was not parsed, make one additional shared search by
-        # the official family/TU and still require exact RU + holder + antigen.
+        primary = [r for r in primary_records if _holder_matches(r, "гематолог") and _antigen_matches(kind, r)]
+        alternatives = [r for r in alt_records if _ru_matches(r, _MEDIKLON_ABO_RH_KELL_RU) and _holder_matches(r, "медиклон") and _antigen_matches(kind, r)]
         if not alternatives:
             family_records, family_error = await mediclone_family(self, request_id)
-            alternatives = [
-                record for record in family_records
-                if _ru_matches(record, _MEDIKLON_ABO_RH_KELL_RU)
-                and _holder_matches(record, "медиклон")
-                and _antigen_matches(kind, record)
-            ]
+            alternatives = [r for r in family_records if _ru_matches(r, _MEDIKLON_ABO_RH_KELL_RU) and _holder_matches(r, "медиклон") and _antigen_matches(kind, r)]
             if family_error and not alt_error:
                 alt_error = family_error
-
         if primary:
             primary = _attach_alternatives(primary, alternatives)
-            logger.info(
-                "ELK exact fallback: «%s» → основной %s / %s; альтернатив %s",
-                name,
-                primary[0].ru_number or "—",
-                primary[0].holder or "—",
-                len(alternatives),
-                extra=log_extra(request_id),
-            )
+            logger.info("ELK exact fallback: «%s» → основной %s / %s; альтернатив %s", name, primary[0].ru_number or "—", primary[0].holder or "—", len(alternatives), extra=log_extra(request_id))
             return primary, None
-
-        logger.warning(
-            "ELK exact fallback: «%s» не подтвердил основной RU=%s; primary_error=%s alt_error=%s",
-            name,
-            primary_ru,
-            primary_error or "—",
-            alt_error or "—",
-            extra=log_extra(request_id),
-        )
+        logger.warning("ELK exact fallback: «%s» не подтвердил основной RU=%s; primary_error=%s alt_error=%s", name, primary_ru, primary_error or "—", alt_error or "—", extra=log_extra(request_id))
         return [], primary_error or alt_error or "официальная карточка нужного семейства не подтвердила позицию"
 
     RegistryService._check_elk = _check_elk_with_fallbacks  # type: ignore[method-assign]

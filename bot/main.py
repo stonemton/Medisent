@@ -29,6 +29,7 @@ from bot.services.registry import close_registry_service
 from bot.services.registry_direct_policy import install_registry_direct_policy
 from bot.services.registry_query_fallbacks import install_registry_query_fallbacks
 from bot.services.registry_primary_policy import install_registry_primary_policy
+from bot.services.unverified_registry_policy import install_unverified_registry_policy
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +48,6 @@ def build_dispatcher() -> Dispatcher:
     dispatcher.include_router(diagnostics.router)
     dispatcher.include_router(admin.router)
     dispatcher.include_router(selection.router)
-    # Intercept batch:* before the legacy intake callback so agent decisions
-    # can continue into concrete RFQ draft preparation.
     dispatcher.include_router(batch_actions.router)
     dispatcher.include_router(intake.router)
     return dispatcher
@@ -61,6 +60,8 @@ async def main() -> None:
     install_registry_direct_policy()
     install_registry_query_fallbacks()
     install_registry_primary_policy()
+    # Missing RU is evidence uncertainty, not a procurement stop condition.
+    install_unverified_registry_policy()
     install_batch_registry_policy()
     install_direct_web_policy()
     install_batch_supplier_policy()
@@ -80,9 +81,7 @@ async def main() -> None:
         me = await bot.get_me()
         logger.info("Бот @%s готов", me.username)
         if warnings:
-            await bot.send_message(
-                settings.telegram_owner_id, texts.started_with_warnings(warnings)
-            )
+            await bot.send_message(settings.telegram_owner_id, texts.started_with_warnings(warnings))
         else:
             await bot.send_message(settings.telegram_owner_id, texts.START)
 

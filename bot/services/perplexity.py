@@ -1,8 +1,8 @@
-"""Поиск поставщиков через Perplexity.
+"""Поиск поставщиков через Perplexity Agent API.
 
-Вызов прямой, не через Membrane: так требует ТЗ. Ответ приходит с источниками,
-из них и берутся кандидаты — домены, а не «названия компаний», потому что
-дедупликация в базе идёт по домену и ИНН.
+Вызов прямой, не через Membrane. Ответ приходит как typed ``output``:
+сообщение модели содержит итоговый текст, а ``search_results`` — источники,
+из которых добираются кандидаты для последующей проверки Firecrawl.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from bot.config import get_settings
 from bot.logging_setup import log_extra
@@ -21,8 +22,9 @@ from bot.services.llm_json import parse_llm_json
 
 logger = logging.getLogger(__name__)
 
-API_URL = "https://api.perplexity.ai/chat/completions"
-DEFAULT_MODEL = "sonar"
+# Perplexity migrated Sonar workloads from Chat Completions to Agent API.
+API_URL = "https://api.perplexity.ai/v1/agent"
+DEFAULT_MODEL = "perplexity/sonar"
 
 # Домены, которые поиск возвращает постоянно и которые поставщиками не являются:
 # агрегаторы, маркетплейсы, справочники, соцсети. Их отсекаем на входе.
@@ -99,6 +101,50 @@ def is_supplier_domain(url: str) -> bool:
     return not any(domain == bad or domain.endswith("." + bad) for bad in NON_SUPPLIER_DOMAINS)
 
 
+def _agent_text(payload: dict[str, Any]) -> str:
+    """Извлечь итоговый текст из Agent API response."""
+    direct = payload.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+
+    parts: list[str] = []
+    for item in payload.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for content in item.get("content") or []:
+            if not isinstance(content, dict):
+                continue
+            text = content.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+    return "\n".join(parts)
+
+
+def _agent_citations(payload: dict[str, Any]) -> list[str]:
+    """Собрать URL из search_results Agent API, сохранив порядок."""
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    # На случай совместимого ответа/будущего alias API поддерживаем citations.
+    for raw in payload.get("citations") or []:
+        url = str(raw or "").strip()
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+
+    for item in payload.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") != "search_results":
+            continue
+        for result in item.get("results") or []:
+            if not isinstance(result, dict):
+                continue
+            url = str(result.get("url") or "").strip()
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+    return urls
+
+
 class PerplexityService:
     def __init__(self) -> None:
         settings = get_settings()
@@ -128,7 +174,7 @@ class PerplexityService:
         request_id: int | None = None,
         model: str = DEFAULT_MODEL,
     ) -> SearchOutcome:
-        """Найти поставщиков изделия."""
+        """Найти поставщиков изделия через Perplexity Agent API."""
         settings = self._settings
         if not settings.search_enabled:
             return SearchOutcome(error="PERPLEXITY_API_KEY не задан")
@@ -139,34 +185,34 @@ class PerplexityService:
             "Нужны названия компаний, их официальные сайты и контакты."
         )
 
+        # Старый код мог передать короткое имя sonar. Agent API ожидает namespace.
+        agent_model = f"perplexity/{model}" if model and "/" not in model else model
+
         result = await self._client.post(
             API_URL,
             operation="search",
             request_id=request_id,
             cost_usd=pricing.flat_cost("perplexity"),
             json={
-                "model": model,
-                "messages": [
+                "model": agent_model or DEFAULT_MODEL,
+                "instructions": self._instruction() + "\n" + SUPPLIERS_SCHEMA_HINT,
+                "input": query,
+                "tools": [
                     {
-                        "role": "system",
-                        "content": self._instruction() + "\n" + SUPPLIERS_SCHEMA_HINT,
-                    },
-                    {"role": "user", "content": query},
+                        "type": "web_search",
+                        "filters": {"search_recency_filter": "year"},
+                    }
                 ],
-                "temperature": 0.1,
-                "search_recency_filter": "year",
             },
         )
         if not result.ok:
             return SearchOutcome(query=query, error=result.error or "Perplexity недоступен")
 
         payload = result.json or {}
-        choices = payload.get("choices") or []
-        if not choices:
+        content = _agent_text(payload)
+        citations = _agent_citations(payload)
+        if not content:
             return SearchOutcome(query=query, error="пустой ответ Perplexity")
-
-        content = choices[0].get("message", {}).get("content", "")
-        citations = [str(c) for c in (payload.get("citations") or [])]
 
         suppliers = _parse_suppliers(content, citations)
         logger.info(

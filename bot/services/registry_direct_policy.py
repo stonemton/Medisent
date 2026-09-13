@@ -1,9 +1,9 @@
 """Prefer the official ELK JSON gateway over Firecrawl.
 
 The existing registry implementation remains as a fallback because the public
-ELK gateway has changed shape in the past. A successful, understood JSON
-response is authoritative and costs no Firecrawl credits; Firecrawl is used
-only when the direct gateway is unavailable or cannot be parsed.
+ELK gateway has changed shape in the past. Useful direct JSON results cost no
+Firecrawl credits; Firecrawl is used only when the direct gateway is unavailable,
+cannot be parsed, or does not return a relevant record.
 """
 from __future__ import annotations
 
@@ -93,14 +93,13 @@ def install_registry_direct_policy() -> None:
         direct_records, direct_error, understood = await _direct_elk(
             self, name, ru_number, request_id
         )
-        if understood:
-            # Understood empty list is a real "not found", not a reason to spend
-            # Firecrawl credits repeating the same official-registry query.
+        if understood and direct_records:
             return direct_records, None
 
+        reason = direct_error or "релевантных записей нет"
         logger.info(
-            "ELK direct недоступен/не разобран (%s) — включаю Firecrawl fallback",
-            direct_error,
+            "ELK direct не дал полезного результата (%s) — включаю Firecrawl fallback",
+            reason,
             extra=log_extra(request_id),
         )
         fallback_records, fallback_error = await original(self, name, ru_number, request_id)
@@ -108,6 +107,6 @@ def install_registry_direct_policy() -> None:
             return fallback_records, None
         if fallback_error:
             return [], fallback_error
-        return [], direct_error
+        return [], (None if understood else direct_error)
 
     RegistryService._check_elk = wrapped  # type: ignore[method-assign]

@@ -19,12 +19,14 @@ from bot.scheduler import start_background_tasks, stop_background_tasks
 from bot.services import guard
 from bot.services.batch_registry_policy import install_batch_registry_policy
 from bot.services.batch_supplier_policy import install_batch_supplier_policy
+from bot.services.direct_web_policy import install_direct_web_policy
 from bot.services.firecrawl import close_firecrawl_service
 from bot.services.gemini import close_gemini_service
 from bot.services.http import flush_meter
 from bot.services.mail import close_mail_service
 from bot.services.perplexity import close_perplexity_service
 from bot.services.registry import close_registry_service
+from bot.services.registry_direct_policy import install_registry_direct_policy
 from bot.services.registry_query_fallbacks import install_registry_query_fallbacks
 from bot.services.registry_primary_policy import install_registry_primary_policy
 
@@ -55,9 +57,12 @@ def build_dispatcher() -> Dispatcher:
 async def main() -> None:
     settings = get_settings()
     setup_logging(settings.log_level, settings.log_dir)
+    # Cheapest/most authoritative path first. Firecrawl remains a fallback.
+    install_registry_direct_policy()
     install_registry_query_fallbacks()
     install_registry_primary_policy()
     install_batch_registry_policy()
+    install_direct_web_policy()
     install_batch_supplier_policy()
 
     warnings = settings.warn_about_missing_keys()

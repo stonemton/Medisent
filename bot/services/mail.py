@@ -1,14 +1,17 @@
-"""Яндекс Почта: отправка запросов цены и приём ответов по SMTP/IMAP.
+"""Почта MEDISENT: Яндекс IMAP для входящих, Brevo HTTPS API для исходящих.
 
-Логика матчинга ответа с заявкой сохраняется прежней:
+Railway блокирует SMTP на Free/Trial/Hobby, поэтому исходящие письма идут
+через HTTPS API Brevo. Ответы по-прежнему читаются из Яндекс Почты по IMAP.
+
+Порядок матчинга ответа с заявкой сохраняется прежним:
 
 1. ``In-Reply-To`` / ``References`` → наш ``Message-ID``;
 2. thread id, если провайдер его даёт;
 3. токен заявки в теме письма;
 4. адрес отправителя — последним.
 
-Сетевые вызовы ``imaplib``/``smtplib`` синхронные, поэтому выполняются через
-``asyncio.to_thread`` и не блокируют Telegram-бота.
+Для писем, отправленных через Brevo, основной надёжный fallback — токен заявки
+в теме: Brevo формирует собственный RFC Message-ID.
 """
 
 from __future__ import annotations
@@ -17,8 +20,8 @@ import asyncio
 import base64
 import imaplib
 import logging
+import os
 import re
-import smtplib
 import ssl
 from dataclasses import dataclass, field
 from email import policy
@@ -27,6 +30,7 @@ from email.parser import BytesParser
 from email.utils import formataddr, make_msgid, parseaddr
 from typing import Any
 
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import get_settings
@@ -38,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 TOKEN_RE = re.compile(r"\b(RFQ-\d{4}-\d+)\b", re.IGNORECASE)
 MESSAGE_ID_RE = re.compile(r"<[^<>\s]+>")
+BREVO_SEND_URL = "https://api.brevo.com/v3/smtp/email"
 
 
 class MailError(RuntimeError):
@@ -111,7 +116,7 @@ async def match_quote(session: AsyncSession, headers: ReplyHeaders) -> MatchResu
 
 
 def new_message_id(sender: str) -> str:
-    """Сгенерировать Message-ID до отправки, чтобы потом матчить ответ."""
+    """Сгенерировать локальный Message-ID для совместимости с текущей БД."""
     return make_msgid(domain=sender.split("@")[-1] if "@" in sender else None)
 
 
@@ -125,11 +130,7 @@ def build_message(
     body: str,
     message_id: str | None = None,
 ) -> tuple[str, str]:
-    """Собрать письмо. Возвращает ``(base64url MIME, Message-ID)``.
-
-    Формат возврата оставлен прежним, чтобы не ломать существующие тесты и
-    вызывающий код после перехода с Gmail API на SMTP.
-    """
+    """Собрать MIME-письмо для совместимости с существующими тестами."""
     message = EmailMessage()
     message["Subject"] = f"[{token}] {subject_suffix}"
     message["From"] = formataddr((sender_name, sender)) if sender_name else sender
@@ -214,15 +215,23 @@ class MailService:
         self._settings = get_settings()
 
     async def aclose(self) -> None:
-        # Соединения открываются на одну операцию; постоянного клиента нет.
         return None
 
-    def _require_enabled(self) -> None:
+    def _require_imap_enabled(self) -> None:
         if not self._settings.yandex_mail_enabled:
             raise MailError("Яндекс Почта не настроена")
 
+    def _brevo_api_key(self) -> str:
+        key = os.getenv("BREVO_API_KEY", "").strip()
+        if not key:
+            raise MailError("BREVO_API_KEY не задан в Railway")
+        return key
+
+    def _sender_email(self) -> str:
+        return os.getenv("BREVO_SENDER_EMAIL", "").strip() or self._settings.yandex_email
+
     def _imap_connect(self) -> imaplib.IMAP4_SSL:
-        self._require_enabled()
+        self._require_imap_enabled()
         try:
             client = imaplib.IMAP4_SSL(
                 self._settings.imap_host,
@@ -241,19 +250,48 @@ class MailService:
         except Exception as exc:
             raise MailError(f"не удалось подключиться к Яндекс IMAP: {exc}") from exc
 
-    def _smtp_send_bytes(self, raw: bytes, recipients: list[str]) -> None:
-        self._require_enabled()
+    async def _brevo_send(
+        self,
+        *,
+        to: str,
+        subject: str,
+        text: str,
+        attachment: dict[str, str] | None = None,
+    ) -> str:
+        sender = self._sender_email()
+        payload: dict[str, Any] = {
+            "sender": {"name": "Medisent", "email": sender},
+            "to": [{"email": to}],
+            "replyTo": {"email": self._settings.yandex_email},
+            "subject": subject,
+            "textContent": text,
+        }
+        if attachment is not None:
+            payload["attachment"] = [attachment]
+
         try:
-            with smtplib.SMTP_SSL(
-                self._settings.smtp_host,
-                self._settings.smtp_port,
-                context=ssl.create_default_context(),
-                timeout=30,
-            ) as smtp:
-                smtp.login(self._settings.yandex_email, self._settings.yandex_app_password)
-                smtp.sendmail(self._settings.yandex_email, recipients, raw)
-        except Exception as exc:
-            raise MailError(f"письмо не отправлено через Яндекс SMTP: {exc}") from exc
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    BREVO_SEND_URL,
+                    headers={
+                        "accept": "application/json",
+                        "api-key": self._brevo_api_key(),
+                        "content-type": "application/json",
+                    },
+                    json=payload,
+                )
+        except httpx.HTTPError as exc:
+            raise MailError(f"Brevo API недоступен: {exc}") from exc
+
+        if response.status_code >= 300:
+            detail = response.text[:500]
+            raise MailError(f"Brevo API вернул {response.status_code}: {detail}")
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise MailError("Brevo API вернул некорректный ответ") from exc
+        return str(data.get("messageId") or "")
 
     def _all_uids_sync(self) -> list[str]:
         client = self._imap_connect()
@@ -287,12 +325,6 @@ class MailService:
     async def find_sent_by_message_id(
         self, message_id: str, *, request_id: int | None = None
     ) -> str | None:
-        """Проверка исходящих после неясного SMTP-сбоя.
-
-        Имена папки «Отправленные» зависят от языка/настроек Яндекса. Чтобы не
-        делать опасный поиск по неверной папке, здесь не предпринимается
-        автоматический повтор: SMTP-ошибка сразу поднимается вызывающему коду.
-        """
         return None
 
     async def send(
@@ -305,27 +337,21 @@ class MailService:
         request_id: int | None = None,
         message_id: str | None = None,
     ) -> tuple[str, str]:
-        settings = self._settings
-        raw_b64, message_id = build_message(
-            sender=settings.yandex_email,
-            sender_name="",
+        # Локальный id оставляем для текущей схемы БД; Brevo сформирует свой
+        # RFC Message-ID. Ответ всё равно надёжно матчится по RFQ-токену в теме.
+        message_id = message_id or new_message_id(self._settings.yandex_email)
+        brevo_id = await self._brevo_send(
             to=to,
-            token=token,
-            subject_suffix=subject_suffix,
-            body=body,
-            message_id=message_id,
+            subject=f"[{token}] {subject_suffix}",
+            text=body,
         )
-        await asyncio.to_thread(self._smtp_send_bytes, _decode_raw_message(raw_b64), [to])
         logger.info(
-            "Письмо отправлено через Яндекс на %s, msgid=%s",
+            "Письмо отправлено через Brevo HTTPS на %s, brevo_msgid=%s",
             to,
-            message_id,
+            brevo_id,
             extra=log_extra(request_id),
         )
-        # В Яндекс IMAP нет Gmail threadId; Message-ID используем как стабильный
-        # технический идентификатор. Основной матчинг ответа всё равно идёт по
-        # In-Reply-To/References.
-        return message_id, message_id
+        return brevo_id or message_id, message_id
 
     async def forward_file(
         self,
@@ -336,21 +362,17 @@ class MailService:
         mime_type: str,
         request_id: int | None = None,
     ) -> None:
-        message = EmailMessage()
-        message["Subject"] = f"Файл из Telegram: {filename}"
-        message["From"] = self._settings.yandex_email
-        message["To"] = to
-        message["Message-ID"] = new_message_id(self._settings.yandex_email)
-        message.set_content("Файл переслан ботом подбора поставщиков.")
-        maintype, _, subtype = mime_type.partition("/")
-        message.add_attachment(
-            content,
-            maintype=maintype or "application",
-            subtype=subtype or "octet-stream",
-            filename=filename,
+        del mime_type
+        await self._brevo_send(
+            to=to,
+            subject=f"Файл из Telegram: {filename}",
+            text="Файл переслан ботом подбора поставщиков.",
+            attachment={
+                "name": filename,
+                "content": base64.b64encode(content).decode("ascii"),
+            },
         )
-        await asyncio.to_thread(self._smtp_send_bytes, message.as_bytes(), [to])
-        logger.info("Файл %s переслан через Яндекс на %s", filename, to, extra=log_extra(request_id))
+        logger.info("Файл %s переслан через Brevo на %s", filename, to, extra=log_extra(request_id))
 
     async def current_history_id(self, request_id: int | None = None) -> str | None:
         """Точка отсчёта для IMAP: максимальный UID во входящих."""
@@ -360,10 +382,7 @@ class MailService:
     async def new_message_ids(
         self, start_history_id: str, *, request_id: int | None = None
     ) -> tuple[list[str], str | None]:
-        """Новые входящие после сохранённого UID.
-
-        Название метода оставлено прежним, чтобы не менять слой scheduler/DB.
-        """
+        """Новые входящие после сохранённого UID."""
         uids = await asyncio.to_thread(self._all_uids_sync)
         if not uids:
             return [], "0"
@@ -374,8 +393,6 @@ class MailService:
         except (TypeError, ValueError):
             start = int(latest)
 
-        # Если в БД остался старый Gmail historyId, не зависаем навсегда:
-        # считаем текущий UID новой точкой отсчёта и старую почту не разбираем.
         if start > int(latest):
             return [], latest
 
@@ -391,7 +408,6 @@ class MailService:
             return None
         parsed = _parse_rfc822(raw, message_id)
         if not full:
-            # Метаданные уже разобраны; тело и вложения не нужны на первом шаге.
             parsed.body = ""
             parsed.attachments = []
         return parsed

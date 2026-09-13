@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 import re
 from dataclasses import dataclass, field
@@ -218,6 +219,9 @@ def render(report: Report) -> list[str]:
     for index, view in enumerate(report.candidates, start=1):
         lines = [f"<b>{index}. {esc(view.supplier_name)}</b>"]
         if view.domain: lines.append(f"   {esc(view.domain)}")
+        if view.site_url:
+            href = html.escape(view.site_url, quote=True)
+            lines.append(f'   🔗 <a href="{href}">страница с упоминанием товара</a>')
         lines.append(f"   {_registry_label(view)}: {_registry_line(view)}")
         ru_match = _ru_match_line(view)
         if ru_match: lines.append(f"   Соответствие предложения этому РУ: {ru_match}")

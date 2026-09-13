@@ -12,7 +12,7 @@ from aiogram.enums import ParseMode
 from bot import texts
 from bot.config import get_settings
 from bot.db.session import dispose_engine
-from bot.handlers import admin, batch_actions, diagnostics, errors, intake, selection
+from bot.handlers import admin, batch_actions, diagnostics, errors, intake, selection, single_rfq_actions
 from bot.logging_setup import setup_logging
 from bot.middleware import OwnerOnlyMiddleware, ThrottleMiddleware
 from bot.scheduler import start_background_tasks, stop_background_tasks
@@ -29,6 +29,7 @@ from bot.services.registry import close_registry_service
 from bot.services.registry_direct_policy import install_registry_direct_policy
 from bot.services.registry_query_fallbacks import install_registry_query_fallbacks
 from bot.services.registry_primary_policy import install_registry_primary_policy
+from bot.services.single_report_actions_policy import install_single_report_actions_policy
 from bot.services.unverified_registry_policy import install_unverified_registry_policy
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ def build_dispatcher() -> Dispatcher:
     dispatcher.include_router(diagnostics.router)
     dispatcher.include_router(admin.router)
     dispatcher.include_router(selection.router)
+    dispatcher.include_router(single_rfq_actions.router)
     dispatcher.include_router(batch_actions.router)
     dispatcher.include_router(intake.router)
     return dispatcher
@@ -65,6 +67,8 @@ async def main() -> None:
     install_batch_registry_policy()
     install_direct_web_policy()
     install_batch_supplier_policy()
+    # A supplier report should immediately offer the next procurement action.
+    install_single_report_actions_policy()
 
     warnings = settings.warn_about_missing_keys()
     logger.info("Запуск бота. Предупреждений: %s", len(warnings))

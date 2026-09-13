@@ -25,8 +25,9 @@ logger=logging.getLogger(__name__)
 MAX_SITES_TO_SCRAPE=24
 PAGE_RU_RE=re.compile(r"\b(?:РЗН|ФСР|ФСЗ)\s*(?:№\s*)?\d{4}/\d+(?:[-/]\d+)?\b",re.I|re.UNICODE)
 _GENERIC_MATCH_TERMS={"степлер","кожный","одноразовый","одноразовая","стерильный","стерильная","изделие","медицинский","медицинское","набор","система","инструмент","аппарат","устройство","скоба","скобы","скобами","штук","упаковка"}
-_NON_SUPPLIER_MARKERS={"сертификат соответствия","сертификац","реестр сертификатов","44-фз","223-фз","закупки","тендер","фас россии","юридические услуги"}
-_SUPPLIER_MARKERS={"купить","цена","в наличии","заказать","корзин","поставк","поставщик","дистрибьютор","дилер","коммерческое предложение","запросить цену","оставить заявку","медицинское оборудование","медицинские изделия"}
+_NON_SUPPLIER_MARKERS={"сертификат соответствия","сертификац","сертификационный центр","реестр сертификатов","регистрационное удостоверение","реестр медицинских изделий","поиск по реестру","аналитика медицинских изделий","44-фз","223-фз","закупки","тендер","фас россии","юридические услуги"}
+_SUPPLIER_MARKERS={"купить","цена","в наличии","заказать","корзин","дистрибьютор","дилер","коммерческое предложение","запросить цену","доставка","на складе"}
+_STRONG_COMMERCE_MARKERS={"купить","цена","в наличии","заказать","корзин","запросить цену","на складе"}
 @dataclass(slots=True)
 class SearchSummary:
  total_found:int=0; blacklisted:int=0; scraped:int=0; registry_state:str=RegistryState.UNAVAILABLE; unrega_state:str=RegistryState.UNAVAILABLE; errors:list[str]=field(default_factory=list); search_failed:bool=False; budget_exceeded:bool=False
@@ -56,7 +57,7 @@ async def run_search(*,request_id:int,product:str,requirements:list[str])->Searc
   if not allowed:
    gated+=1; logger.info("Supplier Gate: исключён %s — %s",item.site or item.name,gate_basis,extra=extra); continue
   accepted.append(item)
-  evidence_url=(scrape.evidence_url if scrape and scrape.evidence_url else item.site) or None
+  evidence_url=(scrape.evidence_url if scrape and getattr(scrape,"evidence_url",None) else item.site) or None
   candidates.append(CandidateInput(supplier_id=sid,site_claims=scrape.claims_stock if scrape and scrape.ok else None,site_url=evidence_url,site_price=scrape.price if scrape and scrape.ok else None,ru_number=best.ru_number if best else None,ru_holder=best.holder if best else None,ru_valid=best.valid if best else None,ru_registry=best.registry if best else None,ru_checked_at=None if registry.unavailable else registry.checked_at,unrega_flags=_unrega_flags(unrega,ru_site_match=ru_match,ru_match_basis=basis),raw={"registry":registry.as_payload(),"registry_match":{"site_matches_ru":ru_match,"basis":basis},"supplier_gate":{"allowed":True,"basis":gate_basis},"search":{"note":item.note,"source":item.source_url},"scrape":{"ok":bool(scrape and scrape.ok),"error":scrape.error if scrape else None,"evidence_url":evidence_url,"injection_suspected":bool((scrape and scrape.injection_suspected) or (item.site or item.name) in tainted)}}))
  async with session_scope() as session:
   if candidates: await repo.upsert_candidates(session,request_id,candidates)
@@ -74,11 +75,10 @@ def _holder_matches(item:object,best:Any)->bool:
 def _supplier_gate(item:object,product:str,scrape:ScrapeResult|None,best:Any,ru_match:bool|None)->tuple[bool,str]:
  if _holder_matches(item,best): return True,"держатель/производитель РУ"
  if scrape is None or not scrape.ok or not scrape.markdown: return False,"страница не проверена"
- text=scrape.markdown.lower(); note=str(getattr(item,"note","") or "").lower(); commercial=bool(getattr(scrape,"claims_stock",None) is True or getattr(scrape,"price",None) is not None or any(m in text for m in _SUPPLIER_MARKERS)); negative=sum(1 for m in _NON_SUPPLIER_MARKERS if m in text); product_hit=ru_match is True or any(t in text for t in _distinctive_terms(product)); model_supplier=any(x in note for x in ("поставщик","продав","дистриб","дилер","производител"))
- if negative>=2 and not (getattr(scrape,"price",None) is not None or getattr(scrape,"claims_stock",None) is True): return False,"информационный/сертификационный/закупочный ресурс"
+ text=scrape.markdown.lower(); commercial=bool(getattr(scrape,"claims_stock",None) is True or getattr(scrape,"price",None) is not None or any(m in text for m in _SUPPLIER_MARKERS)); strong_commerce=bool(getattr(scrape,"claims_stock",None) is True or getattr(scrape,"price",None) is not None or any(m in text for m in _STRONG_COMMERCE_MARKERS)); negative=sum(1 for m in _NON_SUPPLIER_MARKERS if m in text); product_hit=any(t in text for t in _distinctive_terms(product))
+ if negative and not strong_commerce: return False,"реестр/аналитика/сертификационный ресурс, а не продавец товара"
  if product_hit and commercial: return True,"товар + коммерческие признаки на сайте"
- if product_hit and model_supplier and (getattr(scrape,"email",None) or getattr(scrape,"phone",None)): return True,"товар + признаки поставщика + контакты"
- return False,"нет одновременного подтверждения товара и роли поставщика"
+ return False,"нет одновременного подтверждения товара и реальной коммерческой роли"
 def _site_registry_match(product:str,scrape:ScrapeResult|None,best:Any)->tuple[bool|None,str]:
  if best is None or not getattr(best,"ru_number",None): return None,"РУ на изделие не найдено"
  if scrape is None or not scrape.ok or not scrape.markdown: return None,"страница поставщика не проверена"

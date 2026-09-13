@@ -1,7 +1,12 @@
 """Точный fallback-поиск РУ для коротких закупочных наименований Цоликлонов.
 
 Для основной товарной линии используем подтверждённые карточки ELK ООО
-«ГЕМАТОЛОГ». Совпадающее изделие другого держателя сохраняем как альтернативу.
+«ГЕМАТОЛОГ». Совпадающие изделия под другим РУ сохраняем как альтернативы.
+
+Для Цоликлона Анти-D Супер приоритет отдаётся текущей карточке семейства
+ФСР 2012/12983, которую ELK стабильно возвращает и в которой изделие прямо
+перечислено. Более старое отдельное ФСР 2009/05552 показывается как
+дополнительное РУ того же производителя только если его удалось подтвердить.
 """
 from __future__ import annotations
 
@@ -23,7 +28,8 @@ _NOISE_RE = re.compile(r"\b(?:жидк(?:ий|ая|ое)|готов(?:ый|ая|
 _SPACE_RE = re.compile(r"\s+")
 
 _GEMATOLOG_ABO_RU = "ФСР 2008/04007"
-_GEMATOLOG_ANTI_D_SUPER_RU = "ФСР 2009/05552"
+_GEMATOLOG_RH_KELL_KIDD_RU = "ФСР 2012/12983"
+_GEMATOLOG_ANTI_D_LEGACY_RU = "ФСР 2009/05552"
 _GEMATOLOG_ANTI_D_FAMILY_QUERY = (
     "АНТИ-Rho(D) IgM моноклональный реагент для определения резус-принадлежности "
     "крови человека ЭРИТРОТЕСТ Цоликлон Анти-D Супер 9398-002-27575295-2004"
@@ -154,26 +160,14 @@ def install_registry_query_fallbacks() -> None:
         if kind is None:
             return await original_check(self, name, ru_number, request_id)
 
-        primary_ru = _GEMATOLOG_ABO_RU if kind in {"a", "b"} else _GEMATOLOG_ANTI_D_SUPER_RU
+        # A/B имеют отдельное РУ. Для короткого Anti-D без уточнения исполнения
+        # используем текущее семейство ЭРИТРОТЕСТ, где Anti-D Супер прямо входит
+        # в состав и которое ELK стабильно возвращает.
+        primary_ru = _GEMATOLOG_ABO_RU if kind in {"a", "b"} else _GEMATOLOG_RH_KELL_KIDD_RU
         (primary_records, primary_error), (alt_records, alt_error) = await asyncio.gather(
             exact_ru(self, primary_ru, request_id), exact_ru(self, _MEDIKLON_ABO_RH_KELL_RU, request_id)
         )
         primary = [r for r in primary_records if _ru_matches(r, primary_ru) and _holder_matches(r, "гематолог") and _antigen_matches(kind, r)]
-
-        # ELK иногда не находит ФСР 2009/05552 по самому номеру, хотя карточка
-        # находится по официальному наименованию и ТУ. Для Anti-D делаем один
-        # дедуплицированный поиск по официальной товарной строке и всё равно
-        # требуем точный RU + держателя + антиген перед принятием.
-        if kind == "d" and not primary:
-            d_records, d_error = await named_family(self, _GEMATOLOG_ANTI_D_FAMILY_QUERY, request_id)
-            primary = [
-                r for r in d_records
-                if _ru_matches(r, _GEMATOLOG_ANTI_D_SUPER_RU)
-                and _holder_matches(r, "гематолог")
-                and _antigen_matches("d", r)
-            ]
-            if d_error and not primary_error:
-                primary_error = d_error
 
         alternatives = [r for r in alt_records if _ru_matches(r, _MEDIKLON_ABO_RH_KELL_RU) and _holder_matches(r, "медиклон") and _antigen_matches(kind, r)]
         if not alternatives:
@@ -181,6 +175,18 @@ def install_registry_query_fallbacks() -> None:
             alternatives = [r for r in family_records if _ru_matches(r, _MEDIKLON_ABO_RH_KELL_RU) and _holder_matches(r, "медиклон") and _antigen_matches(kind, r)]
             if family_error and not alt_error:
                 alt_error = family_error
+
+        # Для Anti-D дополнительно пытаемся подтвердить исторически отдельное
+        # ФСР 2009/05552 того же ООО «ГЕМАТОЛОГ». Если ELK его не отдаёт, это
+        # не блокирует позицию: основной текущий RU уже подтверждён официально.
+        if kind == "d":
+            legacy_records, _legacy_error = await exact_ru(self, _GEMATOLOG_ANTI_D_LEGACY_RU, request_id)
+            legacy = [r for r in legacy_records if _ru_matches(r, _GEMATOLOG_ANTI_D_LEGACY_RU) and _holder_matches(r, "гематолог") and _antigen_matches("d", r)]
+            if not legacy:
+                d_records, _d_error = await named_family(self, _GEMATOLOG_ANTI_D_FAMILY_QUERY, request_id)
+                legacy = [r for r in d_records if _ru_matches(r, _GEMATOLOG_ANTI_D_LEGACY_RU) and _holder_matches(r, "гематолог") and _antigen_matches("d", r)]
+            alternatives = [*legacy, *alternatives]
+
         if primary:
             primary = _attach_alternatives(primary, alternatives)
             logger.info("ELK exact fallback: «%s» → основной %s / %s; альтернатив %s", name, primary[0].ru_number or "—", primary[0].holder or "—", len(alternatives), extra=log_extra(request_id))

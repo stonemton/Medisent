@@ -1,8 +1,8 @@
 """Поиск поставщиков через Perplexity Agent API.
 
-Search v2 использует несколько независимых поисковых проходов: официальный
-производитель/дистрибьюторы, коммерческие продавцы и, если известно, точный
-номер РУ. Результаты объединяются по домену до проверки Firecrawl.
+Search v3: широкий поиск -> жёсткая последующая проверка Firecrawl. Модельные
+кандидаты имеют приоритет, но подходящие citation-домены тоже сохраняются как
+кандидаты для проверки, а не как автоматически подтверждённые поставщики.
 """
 
 from __future__ import annotations
@@ -25,31 +25,24 @@ logger = logging.getLogger(__name__)
 
 API_URL = "https://api.perplexity.ai/v1/agent"
 DEFAULT_MODEL = "perplexity/sonar"
-MAX_SEARCH_PASSES = 3
+MAX_SEARCH_PASSES = 4
+MAX_CITATION_CANDIDATES = 12
 
-NON_SUPPLIER_DOMAINS = frozenset(
-    {
-        "wikipedia.org", "ru.wikipedia.org", "youtube.com", "vk.com", "ok.ru",
-        "t.me", "telegram.me", "facebook.com", "instagram.com", "twitter.com", "x.com",
-        "avito.ru", "ozon.ru", "wildberries.ru", "market.yandex.ru", "aliexpress.ru",
-        "made-in-china.com", "ru.made-in-china.com", "moy-zakupki.ru",
-        "rusprofile.ru", "list-org.com", "zachestnyibiznes.ru", "sbis.ru",
-        "roszdravnadzor.gov.ru", "zakupki.gov.ru", "consultant.ru", "garant.ru",
-    }
-)
+NON_SUPPLIER_DOMAINS = frozenset({
+    "wikipedia.org", "ru.wikipedia.org", "youtube.com", "vk.com", "ok.ru",
+    "t.me", "telegram.me", "facebook.com", "instagram.com", "twitter.com", "x.com",
+    "avito.ru", "ozon.ru", "wildberries.ru", "market.yandex.ru", "aliexpress.ru",
+    "made-in-china.com", "ru.made-in-china.com", "moy-zakupki.ru",
+    "rusprofile.ru", "list-org.com", "zachestnyibiznes.ru", "sbis.ru",
+    "roszdravnadzor.gov.ru", "zakupki.gov.ru", "consultant.ru", "garant.ru",
+})
 
-SUPPLIERS_SCHEMA_HINT = """Формат ответа (только JSON, без пояснений вокруг):
-{
-  "suppliers": [
-    {"name": "...", "site": "https://...", "email": "...", "phone": "...", "note": "почему это релевантный поставщик"}
-  ]
-}
-Пустые поля оставляй пустой строкой.
-В suppliers включай только реальные компании-производители, официальных дистрибьюторов
-или продавцов, у которых можно запросить/купить именно указанное изделие. Не включай
-маркетплейсы, каталоги, агрегаторы закупок, справочники и просто информационные источники.
-Не добавляй компанию только потому, что её сайт встретился среди результатов поиска:
-должна быть связь с конкретным изделием, брендом/моделью либо номером РУ."""
+SUPPLIERS_SCHEMA_HINT = """Формат ответа (только JSON):
+{"suppliers":[{"name":"...","site":"https://...","email":"...","phone":"...","note":"почему релевантен"}]}
+В suppliers включай производителей, официальных дистрибьюторов и вероятных российских
+продавцов именно этого изделия. Не включай маркетплейсы, каталоги, реестры и справочники.
+Если связь вероятна, но не доказана, можешь включить компанию и явно написать это в note:
+страница будет отдельно проверена Firecrawl. Ничего не выдумывай."""
 
 
 @dataclass(slots=True)
@@ -94,12 +87,9 @@ def _agent_text(payload: dict[str, Any]) -> str:
         if not isinstance(item, dict) or item.get("type") != "message":
             continue
         for content in item.get("content") or []:
-            if not isinstance(content, dict):
-                continue
-            text = content.get("text")
-            if isinstance(text, str) and text.strip():
-                parts.append(text.strip())
-    return "\n".join(parts)
+            if isinstance(content, dict) and isinstance(content.get("text"), str):
+                parts.append(content["text"].strip())
+    return "\n".join(x for x in parts if x)
 
 
 def _agent_citations(payload: dict[str, Any]) -> list[str]:
@@ -108,8 +98,7 @@ def _agent_citations(payload: dict[str, Any]) -> list[str]:
     for raw in payload.get("citations") or []:
         url = str(raw or "").strip()
         if url and url not in seen:
-            seen.add(url)
-            urls.append(url)
+            seen.add(url); urls.append(url)
     for item in payload.get("output") or []:
         if not isinstance(item, dict) or item.get("type") != "search_results":
             continue
@@ -118,13 +107,11 @@ def _agent_citations(payload: dict[str, Any]) -> list[str]:
                 continue
             url = str(result.get("url") or "").strip()
             if url and url not in seen:
-                seen.add(url)
-                urls.append(url)
+                seen.add(url); urls.append(url)
     return urls
 
 
 def _merge_suppliers(groups: list[list[FoundSupplier]]) -> list[FoundSupplier]:
-    """Дедупликация по домену с сохранением наиболее полных контактов."""
     merged: dict[str, FoundSupplier] = {}
     order: list[str] = []
     for group in groups:
@@ -132,216 +119,115 @@ def _merge_suppliers(groups: list[list[FoundSupplier]]) -> list[FoundSupplier]:
             key = domain_of(supplier.site) if supplier.site else supplier.name.strip().lower()
             if not key:
                 continue
-            existing = merged.get(key)
-            if existing is None:
-                merged[key] = supplier
-                order.append(key)
-                continue
-            if not existing.email and supplier.email:
-                existing.email = supplier.email
-            if not existing.phone and supplier.phone:
-                existing.phone = supplier.phone
-            if not existing.site and supplier.site:
-                existing.site = supplier.site
-            if not existing.source_url and supplier.source_url:
-                existing.source_url = supplier.source_url
-            if supplier.note and supplier.note not in existing.note:
-                existing.note = "; ".join(x for x in (existing.note, supplier.note) if x)
+            old = merged.get(key)
+            if old is None:
+                merged[key] = supplier; order.append(key); continue
+            if not old.email and supplier.email: old.email = supplier.email
+            if not old.phone and supplier.phone: old.phone = supplier.phone
+            if not old.site and supplier.site: old.site = supplier.site
+            if supplier.note and supplier.note not in old.note:
+                old.note = "; ".join(x for x in (old.note, supplier.note) if x)
     return [merged[key] for key in order]
+
+
+def _citation_candidates(citations: list[str], known: list[FoundSupplier]) -> list[FoundSupplier]:
+    """Citation — только сырой кандидат. Подтверждение делает Firecrawl/pipeline."""
+    seen = {domain_of(x.site) for x in known if x.site}
+    out: list[FoundSupplier] = []
+    for url in citations:
+        if not is_supplier_domain(url):
+            continue
+        domain = domain_of(url)
+        if not domain or domain in seen:
+            continue
+        seen.add(domain)
+        out.append(FoundSupplier(
+            name=domain,
+            site=url,
+            note="поисковый источник; требует проверки страницы товара",
+            source_url=url,
+        ))
+        if len(out) >= MAX_CITATION_CANDIDATES:
+            break
+    return out
 
 
 class PerplexityService:
     def __init__(self) -> None:
-        settings = get_settings()
-        self._settings = settings
-        self._client = ApiClient(
-            "perplexity",
-            headers={
-                "Authorization": f"Bearer {settings.perplexity_api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout_read=90.0,
-        )
+        settings = get_settings(); self._settings = settings
+        self._client = ApiClient("perplexity", headers={"Authorization": f"Bearer {settings.perplexity_api_key}", "Content-Type": "application/json"}, timeout_read=90.0)
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
     def _instruction(self) -> str:
-        path = Path(self._settings.prompts_dir) / "search.md"
-        return path.read_text(encoding="utf-8")
+        return (Path(self._settings.prompts_dir) / "search.md").read_text(encoding="utf-8")
 
-    async def _search_once(
-        self,
-        query: str,
-        *,
-        request_id: int | None,
-        model: str,
-        pass_name: str,
-    ) -> SearchOutcome:
+    async def _search_once(self, query: str, *, request_id: int | None, model: str, pass_name: str) -> SearchOutcome:
         agent_model = f"perplexity/{model}" if model and "/" not in model else model
-        result = await self._client.post(
-            API_URL,
-            operation=f"search.{pass_name}",
-            request_id=request_id,
-            cost_usd=pricing.flat_cost("perplexity"),
-            json={
-                "model": agent_model or DEFAULT_MODEL,
-                "instructions": self._instruction() + "\n" + SUPPLIERS_SCHEMA_HINT,
-                "input": query,
-                "tools": [
-                    {
-                        "type": "web_search",
-                        "filters": {"search_recency_filter": "year"},
-                    }
-                ],
-            },
-        )
+        result = await self._client.post(API_URL, operation=f"search.{pass_name}", request_id=request_id, cost_usd=pricing.flat_cost("perplexity"), json={
+            "model": agent_model or DEFAULT_MODEL,
+            "instructions": self._instruction() + "\n" + SUPPLIERS_SCHEMA_HINT,
+            "input": query,
+            "tools": [{"type": "web_search"}],
+        })
         if not result.ok:
             return SearchOutcome(query=query, error=result.error or "Perplexity недоступен")
-        payload = result.json or {}
-        content = _agent_text(payload)
-        citations = _agent_citations(payload)
-        if not content:
-            return SearchOutcome(query=query, citations=citations, error="пустой ответ Perplexity")
-        suppliers = _parse_suppliers(content)
-        logger.info(
-            "Perplexity %s: кандидатов %s, источников %s",
-            pass_name,
-            len(suppliers),
-            len(citations),
-            extra=log_extra(request_id),
-        )
-        return SearchOutcome(suppliers=suppliers, citations=citations, query=query)
+        payload = result.json or {}; content = _agent_text(payload); citations = _agent_citations(payload)
+        suppliers = _parse_suppliers(content) if content else []
+        logger.info("Perplexity %s: кандидатов %s, источников %s", pass_name, len(suppliers), len(citations), extra=log_extra(request_id))
+        return SearchOutcome(suppliers=suppliers, citations=citations, query=query, error=None if content or citations else "пустой ответ Perplexity")
 
-    async def find_suppliers(
-        self,
-        product: str,
-        *,
-        requirements: list[str] | None = None,
-        ru_number: str | None = None,
-        holder: str | None = None,
-        request_id: int | None = None,
-        model: str = DEFAULT_MODEL,
-    ) -> SearchOutcome:
-        """Search v2: несколько поисковых стратегий и объединение результатов."""
+    async def find_suppliers(self, product: str, *, requirements: list[str] | None = None, ru_number: str | None = None, holder: str | None = None, request_id: int | None = None, model: str = DEFAULT_MODEL) -> SearchOutcome:
         if not self._settings.search_enabled:
             return SearchOutcome(error="PERPLEXITY_API_KEY не задан")
-
-        extras = f" Дополнительные требования: {'; '.join(requirements)}." if requirements else ""
-        holder_hint = f" Держатель/производитель РУ: {holder}." if holder else ""
-
+        extras = f" Требования: {'; '.join(requirements)}." if requirements else ""
+        holder_hint = f" Держатель РУ: {holder}." if holder else ""
         queries: list[tuple[str, str]] = [
-            (
-                "official",
-                f'Найди в России производителя, официальный сайт, официальных дистрибьюторов и дилеров медицинского изделия "{product}".'
-                f"{holder_hint}{extras} Нужны только компании, реально связанные с этим товаром, с сайтами и контактами.",
-            ),
-            (
-                "commercial",
-                f'Найди российских продавцов и поставщиков, у которых можно купить или запросить КП на медицинское изделие "{product}".'
-                f" Ищи также по сочетаниям: купить, поставщик, дилер, дистрибьютор, прайс, коммерческое предложение.{extras}",
-            ),
+            ("official", f'Россия: производитель, официальный сайт, дилеры и дистрибьюторы "{product}".{holder_hint}{extras}'),
+            ("commercial", f'Купить "{product}" Россия поставщик продавец медицинское изделие прайс КП дилер дистрибьютор.{extras}'),
+            ("exact", f'"{product}" поставщик OR дилер OR дистрибьютор OR купить Россия.{holder_hint}'),
         ]
         if ru_number:
-            queries.append(
-                (
-                    "ru",
-                    f'Найди российские компании и страницы товаров, где указан регистрационный номер "{ru_number}" для изделия "{product}".'
-                    f"{holder_hint} Нужны реальные продавцы/дистрибьюторы, а не реестры, закупки и справочники.",
-                )
-            )
-
-        queries = queries[:MAX_SEARCH_PASSES]
-        outcomes = await asyncio.gather(
-            *[
-                self._search_once(
-                    query,
-                    request_id=request_id,
-                    model=model,
-                    pass_name=pass_name,
-                )
-                for pass_name, query in queries
-            ]
-        )
-
-        good = [outcome for outcome in outcomes if outcome.ok]
+            queries.append(("ru", f'"{ru_number}" "{product}" купить поставщик дилер дистрибьютор Россия. Не показывай реестры и госзакупки.'))
+        outcomes = await asyncio.gather(*[self._search_once(q, request_id=request_id, model=model, pass_name=n) for n, q in queries[:MAX_SEARCH_PASSES]])
+        good = [x for x in outcomes if x.ok]
         if not good:
-            errors = "; ".join(outcome.error or "ошибка поиска" for outcome in outcomes)
-            return SearchOutcome(query=" | ".join(q for _, q in queries), error=errors)
-
-        suppliers = _merge_suppliers([outcome.suppliers for outcome in good])
-        citations: list[str] = []
-        seen_citations: set[str] = set()
+            return SearchOutcome(query=" | ".join(q for _, q in queries), error="; ".join(x.error or "ошибка" for x in outcomes))
+        model_suppliers = _merge_suppliers([x.suppliers for x in good])
+        citations: list[str] = []; seen: set[str] = set()
         for outcome in good:
             for url in outcome.citations:
-                if url not in seen_citations:
-                    seen_citations.add(url)
-                    citations.append(url)
-
-        logger.info(
-            "Perplexity Search v2: по «%s» проходов %s, уникальных кандидатов %s, источников %s",
-            product,
-            len(good),
-            len(suppliers),
-            len(citations),
-            extra=log_extra(request_id),
-        )
-        return SearchOutcome(
-            suppliers=suppliers,
-            citations=citations,
-            query=" | ".join(q for _, q in queries),
-        )
+                if url not in seen:
+                    seen.add(url); citations.append(url)
+        raw_candidates = _citation_candidates(citations, model_suppliers)
+        suppliers = _merge_suppliers([model_suppliers, raw_candidates])
+        logger.info("Perplexity Search v3: «%s», подтверждённых моделью %s, сырых источников %s, всего на проверку %s", product, len(model_suppliers), len(raw_candidates), len(suppliers), extra=log_extra(request_id))
+        return SearchOutcome(suppliers=suppliers, citations=citations, query=" | ".join(q for _, q in queries[:MAX_SEARCH_PASSES]))
 
 
 def _parse_suppliers(content: str) -> list[FoundSupplier]:
-    """Берём только поставщиков, которых модель явно включила в JSON.
-
-    Citation-only домены больше не превращаются автоматически в кандидатов: это
-    был главный источник случайных магазинов и информационных сайтов.
-    """
-    suppliers: list[FoundSupplier] = []
-    seen: set[str] = set()
-    parsed = parse_llm_json(content)
-    rows = parsed.get("suppliers", []) if isinstance(parsed, dict) else []
+    suppliers: list[FoundSupplier] = []; seen: set[str] = set()
+    parsed = parse_llm_json(content); rows = parsed.get("suppliers", []) if isinstance(parsed, dict) else []
     for row in rows:
-        if not isinstance(row, dict):
-            continue
-        site = str(row.get("site") or "").strip()
-        name = str(row.get("name") or "").strip()
-        if not name:
-            continue
-        if site and not is_supplier_domain(site):
-            continue
+        if not isinstance(row, dict): continue
+        site = str(row.get("site") or "").strip(); name = str(row.get("name") or "").strip()
+        if not name or (site and not is_supplier_domain(site)): continue
         key = domain_of(site) if site else name.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        email = str(row.get("email") or "").strip()
-        suppliers.append(
-            FoundSupplier(
-                name=name,
-                site=site,
-                email=email if is_contact_email(email) else "",
-                phone=str(row.get("phone") or "").strip(),
-                note=str(row.get("note") or "").strip(),
-                source_url=site,
-            )
-        )
+        if key in seen: continue
+        seen.add(key); email = str(row.get("email") or "").strip()
+        suppliers.append(FoundSupplier(name=name, site=site, email=email if is_contact_email(email) else "", phone=str(row.get("phone") or "").strip(), note=str(row.get("note") or "").strip(), source_url=site))
     return suppliers
 
 
 _service: PerplexityService | None = None
 
-
 def get_perplexity_service() -> PerplexityService:
     global _service
-    if _service is None:
-        _service = PerplexityService()
+    if _service is None: _service = PerplexityService()
     return _service
-
 
 async def close_perplexity_service() -> None:
     global _service
-    if _service is not None:
-        await _service.aclose()
+    if _service is not None: await _service.aclose()
     _service = None

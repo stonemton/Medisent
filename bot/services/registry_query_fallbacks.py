@@ -235,6 +235,44 @@ def install_registry_query_fallbacks() -> None:
     original_check = _ORIGINAL_CHECK
     cache: dict[tuple[str, str], tuple[list[RegistryRecord], str | None]] = {}
     inflight: dict[tuple[str, str], asyncio.Task[tuple[list[RegistryRecord], str | None]]] = {}
+    records_by_ru: dict[str, list[RegistryRecord]] = {}
+    records_by_card: dict[str, RegistryRecord] = {}
+
+    def remember(records: list[RegistryRecord]) -> list[RegistryRecord]:
+        """Сохраняет уже подтверждённые карточки независимо от поискового запроса.
+
+        Один и тот же ELK record часто находится по разным строкам одной закупки.
+        Запоминаем его по URL карточки и номеру РУ, чтобы соседняя позиция не
+        скачивала ту же страницу повторно и не теряла кандидата при 429.
+        """
+        canonical: list[RegistryRecord] = []
+        for record in records:
+            card_key = _normalise(record.card_url)
+            if card_key:
+                existing = records_by_card.get(card_key)
+                if existing is not None:
+                    record = existing
+                else:
+                    records_by_card[card_key] = record
+            ru_key = _normalise(record.ru_number)
+            if ru_key:
+                bucket = records_by_ru.setdefault(ru_key, [])
+                identity = (
+                    _normalise(record.card_url),
+                    _normalise(record.holder),
+                    _normalise(record.product_name),
+                )
+                if not any(
+                    (
+                        _normalise(item.card_url),
+                        _normalise(item.holder),
+                        _normalise(item.product_name),
+                    ) == identity
+                    for item in bucket
+                ):
+                    bucket.append(record)
+            canonical.append(record)
+        return _dedup_records(canonical)
 
     async def shared_check(
         self: RegistryService,
@@ -247,6 +285,22 @@ def install_registry_query_fallbacks() -> None:
         cached = cache.get(key)
         if cached is not None:
             return cached
+
+        # Самое важное для пакетной закупки: если карточка этого РУ уже была
+        # успешно прочитана для соседней позиции, повторно Firecrawl не вызываем.
+        if ru:
+            reused = records_by_ru.get(_normalise(ru))
+            if reused:
+                logger.info(
+                    "ELK shared card cache: РУ %s переиспользовано (%s карточек)",
+                    ru,
+                    len(reused),
+                    extra=log_extra(request_id),
+                )
+                result = (list(reused), None)
+                cache[key] = result
+                return result
+
         task = inflight.get(key)
         if task is None:
             task = asyncio.create_task(original_check(self, name, ru, request_id))
@@ -257,7 +311,17 @@ def install_registry_query_fallbacks() -> None:
             if inflight.get(key) is task and task.done():
                 inflight.pop(key, None)
         if result[0]:
+            remembered = remember(result[0])
+            result = (remembered, result[1])
             cache[key] = result
+            # Создаём алиасы по номеру РУ. Следующий exact-RU hint получит
+            # карточку из памяти даже если она была найдена обычным name search.
+            for record in remembered:
+                ru_key = _normalise(record.ru_number)
+                if ru_key:
+                    alias_key = ("", ru_key)
+                    alias_records = records_by_ru.get(ru_key, [record])
+                    cache[alias_key] = (list(alias_records), None)
         return result
 
     async def generic_candidates(
@@ -329,7 +393,7 @@ def install_registry_query_fallbacks() -> None:
         request_id: int | None,
     ) -> tuple[list[RegistryRecord], str | None]:
         if ru_number or not name:
-            return await original_check(self, name, ru_number, request_id)
+            return await shared_check(self, name=name, ru=ru_number, request_id=request_id)
 
         # 1) Универсальный путь для любой медпродукции.
         candidates, errors = await generic_candidates(self, name, request_id)

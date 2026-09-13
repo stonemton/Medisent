@@ -25,6 +25,7 @@ from bot.services.mail import close_mail_service
 from bot.services.perplexity import close_perplexity_service
 from bot.services.registry import close_registry_service
 from bot.services.registry_query_fallbacks import install_registry_query_fallbacks
+from bot.services.registry_primary_policy import install_registry_primary_policy
 
 logger = logging.getLogger(__name__)
 
@@ -33,16 +34,12 @@ def build_dispatcher() -> Dispatcher:
     settings = get_settings()
     dispatcher = Dispatcher()
 
-    # Доступ только владельцу — до всего остального.
     owner_only = OwnerOnlyMiddleware(settings.telegram_owner_id)
     throttle = ThrottleMiddleware(interval=1.0)
     for observer in (dispatcher.message, dispatcher.callback_query):
         observer.middleware(owner_only)
         observer.middleware(throttle)
 
-    # Порядок важен. diagnostics/admin ловят команды; selection перехватывает
-    # голосовое, когда заявка ждёт выбора, и пропускает дальше, когда это новая заявка;
-    # intake — всё остальное.
     dispatcher.include_router(errors.router)
     dispatcher.include_router(diagnostics.router)
     dispatcher.include_router(admin.router)
@@ -55,6 +52,7 @@ async def main() -> None:
     settings = get_settings()
     setup_logging(settings.log_level, settings.log_dir)
     install_registry_query_fallbacks()
+    install_registry_primary_policy()
     install_batch_supplier_policy()
 
     warnings = settings.warn_about_missing_keys()
@@ -65,7 +63,6 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dispatcher = build_dispatcher()
-    # Классификатор инъекций грузится здесь, а не посреди первой заявки.
     await asyncio.to_thread(guard.preload)
     tasks = start_background_tasks(bot)
 
@@ -88,7 +85,7 @@ async def main() -> None:
         await close_perplexity_service()
         await close_firecrawl_service()
         await close_mail_service()
-        await flush_meter()  # дописать фоновые строки api_calls до закрытия пула
+        await flush_meter()
         await dispose_engine()
         await bot.session.close()
 

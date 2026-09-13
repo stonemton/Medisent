@@ -1,16 +1,20 @@
 """Распознавание многопозиционных закупочных заявок.
 
-Модуль не меняет обычный ProductRequest. Если во входе одна позиция, intake
-продолжает старый одиночный сценарий. Если позиций несколько, они сохраняются
-в одной master-заявке и дальше обрабатываются пакетным закупочным конвейером.
+Для фото и файлов используем два прохода Gemini: сначала строгий structured output,
+затем более терпимый JSON-проход, если провайдер/модель не приняла responseSchema
+или таблица сложная. Обычный ProductRequest остаётся совместимым с одиночным
+сценарием.
 """
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 
 from bot.services.gemini import GeminiError, Part, get_gemini_service
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -76,13 +80,28 @@ BATCH_SCHEMA = {
     "required": ["items", "confidence"],
 }
 
-BATCH_INSTRUCTION = """Ты разбираешь входящую заявку на закупку медицинских изделий.
-Верни КАЖДУЮ товарную позицию отдельной строкой JSON. Не объединяй разные
-реагенты, размеры, артикулы, фасовки или исполнения. Сохраняй точное название,
-артикул/модель, фасовку, объём и концентрацию, если они видны. Количество и
-единицу измерения вынеси отдельно. Не придумывай отсутствующие сведения.
-Заголовки таблицы, номера строк, служебные колонки и итоги не являются товарами.
-Если позиция одна — всё равно верни массив из одного элемента."""
+BATCH_INSTRUCTION = """Ты — модуль распознавания закупочной заявки медицинских изделий.
+Твоя задача — читать изображение/документ как таблицу, а не угадывать один общий товар.
+
+Верни КАЖДУЮ товарную позицию отдельным элементом items. Не объединяй разные
+реагенты, размеры, артикулы, фасовки или исполнения. Сохраняй максимально точно
+видимое название, марку/артикул/модель, фасовку, объём и концентрацию. Количество
+и единицу измерения вынеси отдельно. Если количество находится в крайнем правом
+столбце — обязательно свяжи его с товаром той же строки.
+
+Игнорируй номера строк, номера колонок, заголовки, служебные колонки, итоги,
+единицу измерения как отдельный товар. Не придумывай отсутствующие сведения.
+Если текст читается неидеально, всё равно верни различимые позиции и понизь confidence.
+Если позиция одна — верни массив из одного элемента.
+
+Ответ только JSON вида:
+{"items":[{"product":"...","qty":"100","unit":"флак","requirements":[],"confidence":0.95}],"confidence":0.95,"transcript":"кратко что было видно"}
+"""
+
+VISION_USER_PROMPT = """Проанализируй приложенное изображение/файл именно как закупочную таблицу.
+Сначала мысленно прочитай строки слева направо, затем верни все товарные позиции.
+Особенно внимательно проверь крайний правый столбец количества. Не отвечай фразой
+«не могу определить изделие»: если видны несколько строк товара, перечисли их все."""
 
 _QTY_TAIL_RE = re.compile(
     r"(?P<qty>\d[\d\s]*(?:[.,]\d+)?)\s*(?P<unit>фл\.?|флакон(?:а|ов)?|шт\.?|штук(?:а|и)?|уп\.?|упаков(?:ка|ки|ок)|компл\.?|комплект(?:а|ов)?)\s*$",
@@ -92,11 +111,7 @@ _NUMBERING_RE = re.compile(r"^\s*(?:\d+[.)]|[-•])\s*")
 
 
 def parse_text_batch(text: str) -> ProcurementBatch:
-    """Дешёвый локальный разбор многострочного списка без LLM.
-
-    Считаем текст батчем только если нашлось минимум две самостоятельные строки
-    с количеством. Обычная фраза не будет ошибочно разбита на несколько товаров.
-    """
+    """Локальный разбор многострочного списка без LLM."""
     raw_lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
     items: list[ProcurementItem] = []
     for raw in raw_lines:
@@ -124,6 +139,10 @@ def _from_payload(payload: dict[str, object]) -> ProcurementBatch:
             if not product:
                 continue
             requirements = row.get("requirements")
+            try:
+                confidence = float(row.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
             items.append(
                 ProcurementItem(
                     product=product,
@@ -132,14 +151,43 @@ def _from_payload(payload: dict[str, object]) -> ProcurementBatch:
                     requirements=[str(x).strip() for x in requirements if str(x).strip()]
                     if isinstance(requirements, list)
                     else [],
-                    confidence=float(row.get("confidence") or 0.0),
+                    confidence=confidence,
                 )
             )
+    try:
+        confidence = float(payload.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
     return ProcurementBatch(
         items=items,
-        confidence=float(payload.get("confidence") or 0.0),
+        confidence=confidence,
         transcript=str(payload.get("transcript") or "").strip() or None,
     )
+
+
+async def _vision_attempt(
+    content: bytes,
+    *,
+    mime_type: str,
+    request_id: int | None,
+    strict_schema: bool,
+) -> ProcurementBatch:
+    service = get_gemini_service()
+    parsed = await service.generate_json(
+        parts=[
+            Part(text=VISION_USER_PROMPT),
+            Part(data=content, mime_type=mime_type),
+        ],
+        system_instruction=BATCH_INSTRUCTION,
+        schema=BATCH_SCHEMA if strict_schema else None,
+        request_id=request_id,
+        operation="intake.batch.strict" if strict_schema else "intake.batch.retry",
+        temperature=0.0,
+    )
+    batch = _from_payload(parsed)
+    if not batch.recognised_items:
+        raise GeminiError("модель вернула JSON без товарных позиций")
+    return batch
 
 
 async def parse_media_batch(
@@ -148,19 +196,35 @@ async def parse_media_batch(
     mime_type: str,
     request_id: int | None = None,
 ) -> ProcurementBatch:
-    service = get_gemini_service()
-    parsed = await service.generate_json(
-        parts=[Part(data=content, mime_type=mime_type)],
-        system_instruction=BATCH_INSTRUCTION,
-        schema=BATCH_SCHEMA,
-        request_id=request_id,
-        operation="intake.batch",
-        temperature=0.0,
-    )
-    batch = _from_payload(parsed)
-    if not batch.recognised_items:
-        raise GeminiError("не удалось распознать товарные позиции")
-    return batch
+    """Распознать таблицу с автоматическим вторым проходом.
+
+    Первый проход использует responseSchema. Если API/модель отказали либо JSON
+    оказался пустым, повторяем без schema, но с тем же жёстким JSON-инструктажем.
+    Это заметно устойчивее на скриншотах таблиц из Telegram.
+    """
+    first_error: GeminiError | None = None
+    try:
+        return await _vision_attempt(
+            content,
+            mime_type=mime_type,
+            request_id=request_id,
+            strict_schema=True,
+        )
+    except GeminiError as exc:
+        first_error = exc
+        logger.warning("Строгий vision-разбор не удался: %s; запускаю retry", exc)
+
+    try:
+        return await _vision_attempt(
+            content,
+            mime_type=mime_type,
+            request_id=request_id,
+            strict_schema=False,
+        )
+    except GeminiError as retry_error:
+        raise GeminiError(
+            f"оба vision-прохода не удались: strict={first_error}; retry={retry_error}"
+        ) from retry_error
 
 
 def serialise_batch(batch: ProcurementBatch) -> str:

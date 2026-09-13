@@ -31,6 +31,10 @@ RU_NUMBER_RE = re.compile(
     r"\b(?:РЗН|ФСР|ФСЗ)\s*(?:№\s*)?\d{4}/\d+(?:[-/]\d+)?\b",
     re.I | re.UNICODE,
 )
+ORG_NAME_RE = re.compile(
+    r"\b(?:ООО|АО|ПАО|ОАО|ЗАО|НАО)\s*[«\"“]?[^\n;|]{2,120}?[»\"”]?(?=$|\n|;|\|)",
+    re.I | re.UNICODE,
+)
 
 
 def derive_state(outcomes: Sequence[Outcome]) -> str:
@@ -136,6 +140,40 @@ def _field_after_label(text: str, *labels: str) -> str | None:
     return None
 
 
+def _holder_from_context(text: str) -> str | None:
+    """Резервно извлекает юрлицо из карточки ELK, когда подпись поля изменилась."""
+    labels = (
+        "держател",
+        "заявител",
+        "уполномоченн",
+        "производител",
+        "организац",
+        "регистрационное удостоверение выдано",
+    )
+    lines = [re.sub(r"\s+", " ", line).strip(" *_`#>-\t") for line in text.splitlines()]
+    for index, line in enumerate(lines):
+        if not line or not any(marker in line.lower() for marker in labels):
+            continue
+        # Иногда значение стоит на той же строке после двоеточия.
+        same = ORG_NAME_RE.search(line)
+        if same:
+            return _clean_md_value(same.group(0))
+        # В ELK значение обычно идёт следующей строкой/строками.
+        for candidate in lines[index + 1 : index + 5]:
+            found = ORG_NAME_RE.search(candidate)
+            if found:
+                return _clean_md_value(found.group(0))
+
+    # Последний безопасный fallback: если на карточке вообще только одно
+    # российское юрлицо, оно гораздо надёжнее «держатель не указан».
+    matches = []
+    for found in ORG_NAME_RE.finditer(text):
+        value = _clean_md_value(found.group(0))
+        if value and value not in matches:
+            matches.append(value)
+    return matches[0] if len(matches) == 1 else None
+
+
 def _parse_elk_card_text(text: str, url: str, query: str) -> RegistryRecord | None:
     ru_number = _field_after_label(
         text,
@@ -159,8 +197,16 @@ def _parse_elk_card_text(text: str, url: str, query: str) -> RegistryRecord | No
         "Наименование организации - уполномоченного представителя производителя (изготовителя) медицинского изделия",
         "Наименования организации - производителя медицинского изделия или организации - изготовителя медицинского изделия",
         "Наименование организации - производителя медицинского изделия или организации - изготовителя медицинского изделия",
+        "Наименование организации, на имя которой выдано регистрационное удостоверение",
+        "Наименование организации, на имя которой выдано РУ",
+        "Юридическое лицо, на имя которого выдано регистрационное удостоверение",
+        "Организация-заявитель",
+        "Наименование заявителя",
         "Заявитель",
+        "Держатель регистрационного удостоверения",
+        "Производитель",
     )
+    holder = holder or _holder_from_context(text)
 
     if not ru_number and not product_name:
         return None
@@ -301,10 +347,11 @@ class RegistryService:
 
             record = _parse_elk_card_text(full_text, url, query)
             logger.info(
-                "ELK: карточка %s len=%s ru=%r product=%r",
+                "ELK: карточка %s len=%s ru=%r holder=%r product=%r",
                 url,
                 len(full_text),
                 record.ru_number if record else None,
+                record.holder if record else None,
                 (record.product_name[:160] if record and record.product_name else None),
                 extra=log_extra(request_id),
             )

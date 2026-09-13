@@ -1,9 +1,10 @@
 """Коммерческий отчёт по кандидатам-поставщикам.
 
-РУ используется на предыдущем этапе только для идентификации самого изделия,
-держателя/производителя и подтверждения, что пользователь выбрал нужный товар.
-После подтверждения коммерческий поиск не требует от каждого продавца указывать
-номер РУ на своей странице и не ранжирует продавцов по такой привязке.
+После подтверждения изделия РУ используется только для идентификации держателя/
+производителя. Поставщики ранжируются по коммерческой роли:
+1) держатель РУ / производитель;
+2) официальный дистрибьютор / дилер с доказательством;
+3) прочие продавцы.
 """
 
 from __future__ import annotations
@@ -62,10 +63,11 @@ class CandidateView:
     ru_valid: bool | None
     ru_registry: str | None
     registry_state: str
-    # Оставлены для совместимости с существующими строками БД, но в
-    # коммерческом отчёте и ранжировании больше не используются.
     ru_site_match: bool | None = None
     ru_match_basis: str | None = None
+    supplier_role: str = "candidate"
+    role_evidence_url: str | None = None
+    role_evidence: str | None = None
     unrega_flags: list[str] = field(default_factory=list)
     injection_suspected: bool = False
     rank: int = 0
@@ -132,6 +134,8 @@ def _normalise_org(value: str | None) -> set[str]:
 
 
 def _is_holder_or_manufacturer(view: CandidateView) -> bool:
+    if view.supplier_role == "manufacturer":
+        return True
     holder_terms = _normalise_org(view.ru_holder)
     if not holder_terms:
         return False
@@ -139,12 +143,28 @@ def _is_holder_or_manufacturer(view: CandidateView) -> bool:
     return any(term in haystack for term in holder_terms)
 
 
-def _role_line(view: CandidateView) -> str:
+def _verified_official_distributor(view: CandidateView) -> bool:
+    return bool(
+        view.supplier_role == "official_distributor"
+        and view.role_evidence_url
+        and view.role_evidence
+    )
+
+
+def _role_priority(view: CandidateView) -> int:
     if _is_holder_or_manufacturer(view):
+        return 1
+    if _verified_official_distributor(view):
+        return 2
+    return 3
+
+
+def _role_line(view: CandidateView) -> str:
+    priority = _role_priority(view)
+    if priority == 1:
         return "1 · держатель РУ / производитель"
-    # Официальность дистрибьютора должна быть доказана отдельным коммерческим
-    # источником. До появления структурированного evidence поля не повышаем
-    # компанию автоматически только по словам поисковой модели.
+    if priority == 2:
+        return "2 · официальный дистрибьютор / дилер"
     return "3 · прочий поставщик"
 
 
@@ -165,13 +185,13 @@ def build_payload(
     criteria: list[dict[str, Any]],
     unrega_state: str = "",
 ) -> dict[str, Any]:
-    """Данные для ранжирования без привязки каждого продавца к номеру РУ."""
     return {
         "product": product,
         "qty": qty,
         "requirements": requirements,
         "criteria": criteria,
         "unrega_state": unrega_state,
+        "ranking_rule": "Сначала группа 1, затем группа 2, затем группа 3. Внутри группы ранжируй по товару, наличию, цене, контактам и критериям.",
         "candidates": [
             {
                 "id": c.candidate_id,
@@ -182,11 +202,10 @@ def build_payload(
                 "site_claims": c.site_claims,
                 "site_url": c.site_url,
                 "site_price": float(c.site_price) if c.site_price is not None else None,
-                "role_priority": 1 if _is_holder_or_manufacturer(c) else 3,
-                "role": "holder_or_manufacturer" if _is_holder_or_manufacturer(c) else "other_supplier",
-                # Номер РУ и site_match намеренно не передаются модели: они уже
-                # отработали на этапе идентификации изделия.
-                "product_identity": {"ru_holder": c.ru_holder},
+                "role_priority": _role_priority(c),
+                "role": _role_line(c),
+                "role_evidence_url": c.role_evidence_url,
+                "role_evidence": c.role_evidence,
                 "unrega_flags": c.unrega_flags,
             }
             for c in candidates
@@ -206,6 +225,7 @@ async def rank_candidates(
 ) -> tuple[list[CandidateView], str, list[str], bool]:
     if not candidates:
         return [], "", [], False
+
     payload = build_payload(
         candidates,
         product=product,
@@ -214,6 +234,8 @@ async def rank_candidates(
         criteria=criteria,
         unrega_state=unrega_state,
     )
+    llm_failed = False
+    parsed: dict[str, Any] = {}
     try:
         parsed = await get_gemini_service().run_prompt_file(
             "report",
@@ -225,18 +247,10 @@ async def rank_candidates(
         )
     except GeminiError as exc:
         logger.error("Ранжирование не удалось: %s", exc, extra=log_extra(request_id))
-        # При локальном fallback всё равно соблюдаем главный приоритет:
-        # держатель/производитель выше прочих поставщиков.
-        ordered = sorted(
-            candidates,
-            key=lambda c: (0 if _is_holder_or_manufacturer(c) else 1, c.candidate_id),
-        )
-        for index, view in enumerate(ordered, start=1):
-            view.rank = index
-        return ordered, "", [], True
+        llm_failed = True
 
     by_id = {c.candidate_id: c for c in candidates}
-    ranked_rows = parsed.get("ranked") or []
+    ranked_rows = parsed.get("ranked") or [] if isinstance(parsed, dict) else []
     seen: set[int] = set()
     for row in ranked_rows:
         if not isinstance(row, dict):
@@ -244,7 +258,6 @@ async def rank_candidates(
         candidate_id = row.get("id")
         matched = by_id.get(_as_id(candidate_id)) if isinstance(candidate_id, int | str) else None
         if matched is None:
-            logger.warning("Модель вернула неизвестный id=%r", candidate_id)
             continue
         matched.rank = int(row.get("rank") or 0)
         matched.reason = scrub_conflation(
@@ -268,15 +281,22 @@ async def rank_candidates(
             tail_rank += 1
             view.rank = tail_rank
 
-    ordered = sorted(candidates, key=lambda c: (c.rank or 10_000, c.candidate_id))
-    missing = parsed.get("missing_data") or []
+    # Роль является жёстким верхнеуровневым приоритетом и не может быть
+    # переопределена моделью. Ранг модели работает только внутри одной группы.
+    ordered = sorted(
+        candidates,
+        key=lambda c: (_role_priority(c), c.rank or 10_000, c.candidate_id),
+    )
+    for index, view in enumerate(ordered, start=1):
+        view.rank = index
+
+    missing = parsed.get("missing_data") or [] if isinstance(parsed, dict) else []
+    summary = parsed.get("summary") or "" if isinstance(parsed, dict) else ""
     return (
         ordered,
-        scrub_conflation(
-            str(parsed.get("summary") or "").strip(), where="summary", request_id=request_id
-        ),
+        scrub_conflation(str(summary).strip(), where="summary", request_id=request_id),
         [str(m) for m in missing if str(m).strip()] if isinstance(missing, list) else [],
-        False,
+        llm_failed,
     )
 
 
@@ -304,6 +324,12 @@ def render(report: Report) -> list[str]:
         if view.site_url:
             href = html.escape(view.site_url, quote=True)
             lines.append(f'   🔗 <a href="{href}">страница с упоминанием товара</a>')
+        if _verified_official_distributor(view):
+            evidence_href = html.escape(view.role_evidence_url or "", quote=True)
+            evidence_text = esc(view.role_evidence or "официальный статус подтверждён")
+            lines.append(
+                f'   ✅ Официальность: <a href="{evidence_href}">{evidence_text}</a>'
+            )
         lines.append(f"   Наличие: {esc(_site_line(view))}")
         if view.site_price is not None:
             lines.append(f"   Цена на сайте: {view.site_price:,.0f} ₽".replace(",", " "))

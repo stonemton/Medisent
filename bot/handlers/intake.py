@@ -232,4 +232,8 @@ async def on_text(message: Message) -> None:
         # модели, и терять его из-за отсутствия ключа незачем.
         parsed = ProductRequest(product=text, raw_input=text)
 
+    # Локальный парсер удаляет количество из названия. Если после него остались
+    # разделители вроде «, .», не отправляем этот мусор в поиск и в отчёт.
+    parsed.product = parsed.product.strip(" \t\r\n,.;:-")
+
     await _start_pipeline(message, parsed, "text")

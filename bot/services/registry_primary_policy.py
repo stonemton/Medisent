@@ -9,13 +9,30 @@ from __future__ import annotations
 
 import re
 from collections.abc import Awaitable, Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import replace
-from typing import Any
+from typing import Any, Iterator
 
 from bot.services.agent import choose_registry_primary
 from bot.services.registry_endpoints import RegistryRecord
 
 _ORIGINAL_CHECK: Callable[..., Awaitable[tuple[list[RegistryRecord], str | None]]] | None = None
+_SUSPEND_AGENT: ContextVar[bool] = ContextVar("registry_primary_policy_suspend_agent", default=False)
+
+
+@contextmanager
+def suspend_registry_primary_agent() -> Iterator[None]:
+    """Temporarily keep deterministic registry ordering without per-item LLM calls.
+
+    Used by batch intake so the whole procurement can be arbitrated in one GPT
+    request instead of one model request per line.
+    """
+    token = _SUSPEND_AGENT.set(True)
+    try:
+        yield
+    finally:
+        _SUSPEND_AGENT.reset(token)
 
 
 def _norm(value: str | None) -> str:
@@ -28,6 +45,7 @@ def _payload(record: RegistryRecord) -> dict[str, Any]:
         "holder": record.holder,
         "product_name": record.product_name,
         "valid": record.valid,
+        "status_text": record.status_text,
         "card_url": record.card_url,
         "registry": record.registry,
         "source": record.raw.get("source") if isinstance(record.raw, dict) else None,
@@ -76,7 +94,7 @@ def install_registry_primary_policy() -> None:
         request_id: int | None,
     ) -> tuple[list[RegistryRecord], str | None]:
         records, error = await original(self, name, ru_number, request_id)
-        if ru_number or not name or not records:
+        if ru_number or not name or not records or _SUSPEND_AGENT.get():
             return records, error
 
         current = records[0]

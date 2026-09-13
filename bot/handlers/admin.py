@@ -1,4 +1,4 @@
-"""Команды владельца: /start, /help, /testmail, /stats, /session, /blacklist, /cancel."""
+"""Команды владельца: /start, /help, /testdraft, /stats, /session, /blacklist, /cancel."""
 
 from __future__ import annotations
 
@@ -29,9 +29,9 @@ async def cmd_help(message: Message) -> None:
     await message.answer(texts.HELP)
 
 
-@router.message(Command("testmail"))
-async def cmd_testmail(message: Message) -> None:
-    """Отправить тестовое письмо через Brevo HTTPS API на Яндекс-ящик."""
+@router.message(Command("testdraft"))
+async def cmd_testdraft(message: Message) -> None:
+    """Создать тестовый черновик в Яндекс.Почте через IMAP."""
     settings = get_settings()
     if not settings.yandex_mail_enabled:
         await message.answer("Яндекс Почта не настроена в Railway.")
@@ -40,14 +40,29 @@ async def cmd_testmail(message: Message) -> None:
         await get_mail_service().send(
             to=settings.yandex_email,
             token="RFQ-TEST-1",
-            subject_suffix="Тест MEDISENT",
-            body="Тестовое письмо MEDISENT. Если вы его получили, отправка через Brevo HTTPS работает.",
+            subject_suffix="Тест черновика MEDISENT",
+            body=(
+                "Тестовый черновик MEDISENT.\n\n"
+                "Если вы видите это письмо в папке «Черновики» Яндекс.Почты, "
+                "создание черновиков через IMAP работает.\n"
+            ),
         )
     except MailError as exc:
-        logger.exception("Тест отправки почты не удался")
-        await message.answer(f"Ошибка отправки: {exc}")
+        logger.exception("Тест создания черновика не удался")
+        await message.answer(f"Ошибка создания черновика: {exc}")
         return
-    await message.answer("Тестовое письмо отправлено через Brevo на ваш Yandex-ящик.")
+    await message.answer(
+        "Готово. Тестовый черновик создан в Яндекс.Почте. Проверьте папку «Черновики»."
+    )
+
+
+@router.message(Command("testmail"))
+async def cmd_testmail(message: Message) -> None:
+    """Подсказать новый безопасный режим без автоматической отправки."""
+    await message.answer(
+        "Автоматическая отправка отключена. Используйте /testdraft — MEDISENT создаст "
+        "готовый черновик в Яндекс.Почте, а отправку вы подтвердите вручную."
+    )
 
 
 @router.message(Command("stats"))

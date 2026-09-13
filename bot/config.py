@@ -62,9 +62,7 @@ class Settings(BaseSettings):
     registry_elk_base: str = "https://elk.roszdravnadzor.gov.ru"
     registry_misearch_url: str = "https://roszdravnadzor.gov.ru/services/misearch"
     registry_unrega_url: str = "https://roszdravnadzor.gov.ru/services/unreg"
-    # Временно 0: старый кэш содержит РУ без holder и мешает увидеть
-    # свежую карточку ELK. После исправления парсера вернём обычный TTL.
-    registry_cache_days: int = 0
+    registry_cache_days: int = 30
 
     # --- Эксплуатация ---------------------------------------------------
     log_level: str = "INFO"

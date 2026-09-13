@@ -31,7 +31,7 @@ async def cmd_help(message: Message) -> None:
 
 @router.message(Command("testmail"))
 async def cmd_testmail(message: Message) -> None:
-    """Отправить тестовое письмо через настроенную Яндекс Почту самому себе."""
+    """Отправить тестовое письмо через Brevo HTTPS API на Яндекс-ящик."""
     settings = get_settings()
     if not settings.yandex_mail_enabled:
         await message.answer("Яндекс Почта не настроена в Railway.")
@@ -41,13 +41,13 @@ async def cmd_testmail(message: Message) -> None:
             to=settings.yandex_email,
             token="RFQ-TEST-1",
             subject_suffix="Тест MEDISENT",
-            body="Тестовое письмо MEDISENT. Если вы его получили, SMTP Яндекс Почты работает.",
+            body="Тестовое письмо MEDISENT. Если вы его получили, отправка через Brevo HTTPS работает.",
         )
     except MailError as exc:
-        logger.exception("Тест Яндекс Почты не удался")
+        logger.exception("Тест отправки почты не удался")
         await message.answer(f"Ошибка отправки: {exc}")
         return
-    await message.answer("Тестовое письмо отправлено на ваш Yandex-ящик.")
+    await message.answer("Тестовое письмо отправлено через Brevo на ваш Yandex-ящик.")
 
 
 @router.message(Command("stats"))

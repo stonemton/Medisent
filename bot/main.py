@@ -17,6 +17,7 @@ from bot.logging_setup import setup_logging
 from bot.middleware import OwnerOnlyMiddleware, ThrottleMiddleware
 from bot.scheduler import start_background_tasks, stop_background_tasks
 from bot.services import guard
+from bot.services.batch_supplier_policy import install_batch_supplier_policy
 from bot.services.firecrawl import close_firecrawl_service
 from bot.services.gemini import close_gemini_service
 from bot.services.http import flush_meter
@@ -54,6 +55,7 @@ async def main() -> None:
     settings = get_settings()
     setup_logging(settings.log_level, settings.log_dir)
     install_registry_query_fallbacks()
+    install_batch_supplier_policy()
 
     warnings = settings.warn_about_missing_keys()
     logger.info("Запуск бота. Предупреждений: %s", len(warnings))

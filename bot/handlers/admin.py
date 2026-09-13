@@ -1,4 +1,4 @@
-"""Команды владельца: /start, /help, /stats, /session, /blacklist, /cancel."""
+"""Команды владельца: /start, /help, /testmail, /stats, /session, /blacklist, /cancel."""
 
 from __future__ import annotations
 
@@ -9,9 +9,11 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import Message
 
 from bot import texts
+from bot.config import get_settings
 from bot.db import repo
 from bot.db.session import session_scope
 from bot.pipeline import close_request
+from bot.services.mail import MailError, get_mail_service
 
 logger = logging.getLogger(__name__)
 router = Router(name="admin")
@@ -25,6 +27,27 @@ async def cmd_start(message: Message) -> None:
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await message.answer(texts.HELP)
+
+
+@router.message(Command("testmail"))
+async def cmd_testmail(message: Message) -> None:
+    """Отправить тестовое письмо через настроенную Яндекс Почту самому себе."""
+    settings = get_settings()
+    if not settings.yandex_mail_enabled:
+        await message.answer("Яндекс Почта не настроена в Railway.")
+        return
+    try:
+        await get_mail_service().send(
+            to=settings.yandex_email,
+            token="RFQ-TEST-1",
+            subject_suffix="Тест MEDISENT",
+            body="Тестовое письмо MEDISENT. Если вы его получили, SMTP Яндекс Почты работает.",
+        )
+    except MailError as exc:
+        logger.exception("Тест Яндекс Почты не удался")
+        await message.answer(f"Ошибка отправки: {exc}")
+        return
+    await message.answer("Тестовое письмо отправлено на ваш Yandex-ящик.")
 
 
 @router.message(Command("stats"))
@@ -77,11 +100,7 @@ async def cmd_cancel(message: Message) -> None:
 
 @router.message(Command("blacklist"))
 async def cmd_blacklist(message: Message, command: CommandObject) -> None:
-    """Показать список, добавить или снять.
-
-    Чёрный список — отдельная таблица с причиной и датой, а не флажок:
-    через полгода надо будет вспомнить, за что поставщика закрыли.
-    """
+    """Показать список, добавить или снять."""
     args = (command.args or "").split(maxsplit=2)
 
     if not args:

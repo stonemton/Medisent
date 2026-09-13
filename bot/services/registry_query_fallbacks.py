@@ -7,14 +7,15 @@
 известными официальными семействами, не подставляя номер РУ из памяти.
 
 Для известных товарных семейств fallback дополнительно привязывается к
-держателю/производителю. Это не даёт принять корректное РУ от другого
-производителя только потому, что короткое торговое наименование совпало.
+держателю/производителю. Совпадающие изделия других держателей не становятся
+основным матчем, но сохраняются как альтернативные РУ для показа пользователю.
 """
 from __future__ import annotations
 
 import logging
 import re
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from bot.logging_setup import log_extra
 from bot.services.registry_endpoints import RegistryRecord
@@ -71,8 +72,6 @@ def registry_query_variants(name: str) -> list[str]:
         if value and value.lower() != original.lower() and value not in variants:
             variants.append(value)
 
-    # Сначала специфичные официальные семейства/ТУ. Только после них —
-    # короткое торговое имя, которое может совпадать у разных производителей.
     if "цоликлон" in low and ("анти-а" in low or "anti-a" in low):
         add("Цоликлоны Анти-А Анти-В Анти-АВ 9398-001-27575295-2004")
         add("Цоликлоны Анти-А, Анти-В и Анти-АВ")
@@ -117,6 +116,41 @@ def _variant_expected_holder(variant: str) -> str | None:
     return "гематолог" if "27575295" in variant else None
 
 
+def _alternative_payload(record: RegistryRecord) -> dict[str, Any]:
+    return {
+        "ru_number": record.ru_number,
+        "holder": record.holder,
+        "product_name": record.product_name,
+        "valid": record.valid,
+        "card_url": record.card_url,
+    }
+
+
+def _add_alternative(alternatives: list[dict[str, Any]], record: RegistryRecord) -> None:
+    payload = _alternative_payload(record)
+    key = (
+        str(payload.get("ru_number") or "").strip().lower(),
+        str(payload.get("holder") or "").strip().lower(),
+    )
+    if not any(
+        (
+            str(item.get("ru_number") or "").strip().lower(),
+            str(item.get("holder") or "").strip().lower(),
+        ) == key
+        for item in alternatives
+    ):
+        alternatives.append(payload)
+
+
+def _attach_alternatives(records: list[RegistryRecord], alternatives: list[dict[str, Any]]) -> None:
+    if not alternatives:
+        return
+    for record in records:
+        raw = dict(record.raw) if isinstance(record.raw, dict) else {}
+        raw["registry_alternatives"] = alternatives
+        record.raw = raw
+
+
 def install_registry_query_fallbacks() -> None:
     """Один раз добавляет fallback к RegistryService._check_elk."""
     global _ORIGINAL_CHECK
@@ -135,59 +169,80 @@ def install_registry_query_fallbacks() -> None:
         request_id: int | None,
     ) -> tuple[list[RegistryRecord], str | None]:
         records, error = await original_check(self, name, ru_number, request_id)
-        if records or ru_number or not name:
+        if ru_number or not name:
             return records, error
+
+        locked_family = _is_gematolog_cyclone(name)
+        if not locked_family:
+            return records, error
+
+        alternatives: list[dict[str, Any]] = []
+        primary: list[RegistryRecord] = []
+
+        # Точный короткий запрос может уверенно найти изделие другого производителя.
+        # Не теряем его: показываем как другое РУ, но не делаем основным матчем.
+        for record in records:
+            if not _discriminant_matches(name, record):
+                continue
+            if _holder_matches(record, "гематолог"):
+                primary.append(record)
+            else:
+                _add_alternative(alternatives, record)
 
         attempts: list[str] = []
         last_error = error
-        locked_family = _is_gematolog_cyclone(name)
         for variant in registry_query_variants(name):
             attempts.append(variant)
             fallback_records, fallback_error = await original_check(
                 self, variant, None, request_id
             )
-            if fallback_records:
-                expected_holder = _variant_expected_holder(variant)
-                relevant = [
-                    record for record in fallback_records
-                    if _discriminant_matches(name, record)
-                    and (expected_holder is None or _holder_matches(record, expected_holder))
-                ]
-                if relevant:
-                    # Для коротких Цоликлонов не принимаем карточку чужого
-                    # производителя на широком fallback. Сначала должна быть
-                    # подтверждена специфичная линия/ТУ ООО «ГЕМАТОЛОГ».
-                    if locked_family and expected_holder is None:
-                        gematolog_records = [r for r in relevant if _holder_matches(r, "гематолог")]
-                        if not gematolog_records:
-                            logger.warning(
-                                "ELK fallback: «%s» через «%s» дал только другого держателя — игнорирую",
-                                name,
-                                variant,
-                                extra=log_extra(request_id),
-                            )
-                            continue
-                        relevant = gematolog_records
+            expected_holder = _variant_expected_holder(variant)
 
-                    logger.info(
-                        "ELK fallback: «%s» найдено через «%s», записей %s, держатель=%s",
-                        name,
-                        variant,
-                        len(relevant),
-                        relevant[0].holder or "—",
-                        extra=log_extra(request_id),
-                    )
-                    return relevant, None
+            for record in fallback_records:
+                if not _discriminant_matches(name, record):
+                    continue
+                holder_ok = _holder_matches(record, expected_holder or "гематолог")
+                if holder_ok:
+                    if not any(
+                        (r.ru_number, r.holder) == (record.ru_number, record.holder)
+                        for r in primary
+                    ):
+                        primary.append(record)
+                else:
+                    _add_alternative(alternatives, record)
+
             if fallback_error:
                 last_error = fallback_error
 
+        if primary:
+            _attach_alternatives(primary, alternatives)
+            logger.info(
+                "ELK fallback: «%s» основной держатель подтверждён, РУ=%s; альтернативных РУ=%s",
+                name,
+                primary[0].ru_number or "—",
+                len(alternatives),
+                extra=log_extra(request_id),
+            )
+            return primary, None
+
+        if alternatives:
+            logger.warning(
+                "ELK fallback: «%s» найдены только совпадающие изделия других держателей: %s",
+                name,
+                ", ".join(
+                    f"{item.get('ru_number') or 'РУ —'} / {item.get('holder') or 'держатель —'}"
+                    for item in alternatives[:5]
+                ),
+                extra=log_extra(request_id),
+            )
+
         if attempts:
             logger.info(
-                "ELK fallback: «%s» варианты не дали согласованного РУ: %s",
+                "ELK fallback: «%s» варианты не дали согласованного основного РУ: %s",
                 name,
                 " | ".join(attempts),
                 extra=log_extra(request_id),
             )
-        return records, error or last_error
+        return [], error or last_error
 
     RegistryService._check_elk = _check_elk_with_fallbacks  # type: ignore[method-assign]

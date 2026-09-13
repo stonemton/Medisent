@@ -2,14 +2,9 @@
 
 Оркестратор — код бота. Ни n8n, ни CRM в схеме нет.
 
-Порядок шагов важен: проверка в реестре идёт по изделию один раз, а не по
-каждому поставщику, потому что реестр отвечает про изделие и про поставщиков
-не знает ничего. Дилеров в реестре нет вообще.
-
-Сессии базы здесь короткие и открываются только вокруг записи. Внешние вызовы
-(поиск, реестры, обход сайтов) идут минутами, и держать на это время открытую
-транзакцию нельзя: managed-база убивает соединения, простаивающие в
-транзакции, и финальный коммит падал бы уже после того, как деньги потрачены.
+Проверка в реестре идёт по изделию один раз. После обхода сайтов отдельный
+детерминированный шаг проверяет, можно ли связать товар каждого поставщика
+именно с найденным РУ. Это не одно и то же.
 """
 
 from __future__ import annotations
@@ -68,7 +63,6 @@ async def run_search(
     product: str,
     requirements: list[str],
 ) -> SearchSummary:
-    """Найти поставщиков, проверить изделие в реестрах, записать кандидатов."""
     extra = log_extra(request_id)
     summary = SearchSummary()
     registry_service = get_registry_service()
@@ -151,16 +145,19 @@ async def run_search(
                 site_claims=scrape.claims_stock if scrape and scrape.ok else None,
                 site_url=item.site or None,
                 site_price=scrape.price if scrape and scrape.ok else None,
-                # Это РУ на изделие из официального реестра. Отдельный флаг
-                # registry_match ниже отвечает на другой вопрос: есть ли на
-                # странице КОНКРЕТНОГО поставщика достаточно данных, чтобы
-                # связать его товар именно с этим РУ.
                 ru_number=best.ru_number if best else None,
                 ru_holder=best.holder if best else None,
                 ru_valid=best.valid if best else None,
                 ru_registry=best.registry if best else None,
                 ru_checked_at=None if registry.unavailable else registry.checked_at,
-                unrega_flags=_unrega_flags(unrega),
+                # Поле уже JSON, поэтому сохраняем здесь и состояние писем, и
+                # отдельную привязку товара поставщика к найденному РУ — без
+                # миграции схемы БД.
+                unrega_flags=_unrega_flags(
+                    unrega,
+                    ru_site_match=site_ru_match,
+                    ru_match_basis=match_basis,
+                ),
                 raw={
                     "registry": registry.as_payload(),
                     "registry_match": {
@@ -201,14 +198,12 @@ async def run_search(
 
 
 async def close_request(session: AsyncSession, request_id: int) -> bool:
-    """Закрыть заявку и забыть её счётчик расходов. Единственный путь в closed."""
     closed = await repo.transition(session, request_id, RequestStatus.CLOSED)
     budget.forget(request_id)
     return closed
 
 
 async def _nothing() -> list[ScrapeResult]:
-    """Заглушка на место обхода сайтов, когда обходить нечего."""
     return []
 
 
@@ -230,14 +225,7 @@ def _site_registry_match(
     scrape: ScrapeResult | None,
     best: Any,
 ) -> tuple[bool | None, str]:
-    """Связать товар конкретного поставщика с найденным РУ без догадок.
-
-    True ставится только по сильному признаку: точный номер РУ на странице
-    поставщика либо отличительный бренд/модель, который одновременно есть в
-    запросе, официальной карточке ELK и на странице поставщика. Отсутствие
-    доказательства — None, а не False. False ставится только при явном
-    противоречии: на странице есть другой номер РУ.
-    """
+    """Связать товар конкретного поставщика с найденным РУ без догадок."""
     if best is None or not getattr(best, "ru_number", None):
         return None, "РУ на изделие не найдено"
     if scrape is None or not scrape.ok or not scrape.markdown:
@@ -254,14 +242,14 @@ def _site_registry_match(
     if page_ru_numbers and expected_ru not in page_ru_numbers:
         return False, "на странице поставщика указан другой номер РУ"
 
+    raw = getattr(best, "raw", {}) or {}
+    raw_text = raw.get("text") if isinstance(raw, dict) else ""
     registry_text = " ".join(
         str(value or "")
         for value in (
             getattr(best, "product_name", None),
             getattr(best, "holder", None),
-            (getattr(best, "raw", {}) or {}).get("text")
-            if isinstance(getattr(best, "raw", {}), dict)
-            else "",
+            raw_text,
         )
     ).lower()
     distinct = _distinctive_terms(product)
@@ -273,16 +261,22 @@ def _site_registry_match(
     return None, "на странице поставщика недостаточно данных для привязки к РУ"
 
 
-def _unrega_flags(unrega: RegistryResult) -> dict[str, Any]:
+def _unrega_flags(
+    unrega: RegistryResult,
+    *,
+    ru_site_match: bool | None,
+    ru_match_basis: str,
+) -> dict[str, Any]:
     return {
         "state": unrega.state,
         "items": [r.product_name or r.status_text or "письмо" for r in unrega.records],
         "errors": unrega.errors,
+        "ru_site_match": ru_site_match,
+        "ru_match_basis": ru_match_basis,
     }
 
 
 def _resolve_supplier_id(item: object, key_to_id: dict[str, int]) -> int | None:
-    """Найти id поставщика по тому же ключу, каким его писал upsert."""
     site = getattr(item, "site", "") or ""
     name = getattr(item, "name", "") or ""
     if site:
@@ -298,7 +292,6 @@ async def _enrich_contacts(
     scrapes: dict[str, ScrapeResult],
     key_to_id: dict[str, int],
 ) -> None:
-    """Дописать e-mail и телефон, найденные скрейпом."""
     updates: list[SupplierInput] = []
     for item in suppliers:
         site = getattr(item, "site", "") or ""
@@ -327,7 +320,6 @@ async def build_report(
     qty: str,
     requirements: list[str],
 ) -> Report:
-    """Собрать отчёт по кандидатам заявки."""
     request = await repo.get_request(session, request_id)
     token = request.token if request else "?"
 
@@ -348,8 +340,8 @@ async def build_report(
             ru_valid=row.ru_valid,
             ru_registry=row.ru_registry,
             registry_state=_registry_state(row),
-            ru_site_match=getattr(row, "ru_site_match", None),
-            ru_match_basis=getattr(row, "ru_match_basis", None),
+            ru_site_match=_ru_site_match(row.unrega_flags),
+            ru_match_basis=_ru_match_basis(row.unrega_flags),
             unrega_flags=_unrega_items(row.unrega_flags),
             injection_suspected=bool(row.injection_suspected),
         )
@@ -396,6 +388,20 @@ def _unrega_items(value: object) -> list[str]:
     if isinstance(value, dict):
         return [str(item) for item in value.get("items", []) or []]
     return []
+
+
+def _ru_site_match(value: object) -> bool | None:
+    if isinstance(value, dict):
+        match = value.get("ru_site_match")
+        return match if isinstance(match, bool) else None
+    return None
+
+
+def _ru_match_basis(value: object) -> str | None:
+    if isinstance(value, dict):
+        basis = value.get("ru_match_basis")
+        return str(basis) if basis else None
+    return None
 
 
 def _unrega_state(rows: Sequence[Any]) -> str:

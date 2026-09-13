@@ -6,11 +6,12 @@
 тексте карточки, а основной матч должен принадлежать ООО «ГЕМАТОЛОГ».
 
 Совпадающее изделие другого держателя сохраняется как альтернативное РУ.
-Это одновременно не смешивает производителей и резко снижает число запросов
-к Firecrawl, чтобы не упираться в лимит 15 req/min.
+Точные RU-поиски дедуплицируются даже при параллельной обработке batch, чтобы
+A/B/D не запускали одинаковую проверку альтернативного РУ одновременно.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable
@@ -34,8 +35,6 @@ _NOISE_RE = re.compile(
 )
 _SPACE_RE = re.compile(r"\s+")
 
-# Эти номера не подставляются в ответ вслепую: они лишь используются как
-# точные поисковые ключи ELK. Карточка всё равно загружается и проверяется.
 _GEMATOLOG_ABO_RU = "ФСР 2008/04007"
 _GEMATOLOG_RH_KELL_KIDD_RU = "ФСР 2012/12983"
 _MEDIKLON_ABO_RH_KELL_RU = "ФСР 2009/06043"
@@ -134,9 +133,8 @@ def install_registry_query_fallbacks() -> None:
     _ORIGINAL_CHECK = RegistryService._check_elk
     original_check = _ORIGINAL_CHECK
 
-    # A и B используют одни и те же карточки. Кэшируем только точные RU-поиски
-    # внутри процесса, чтобы один batch не делал одинаковые запросы несколько раз.
     exact_cache: dict[str, tuple[list[RegistryRecord], str | None]] = {}
+    exact_inflight: dict[str, asyncio.Task[tuple[list[RegistryRecord], str | None]]] = {}
 
     async def exact_ru(
         self: RegistryService, ru: str, request_id: int | None
@@ -144,7 +142,17 @@ def install_registry_query_fallbacks() -> None:
         cached = exact_cache.get(ru)
         if cached is not None:
             return cached
-        result = await original_check(self, None, ru, request_id)
+
+        task = exact_inflight.get(ru)
+        if task is None:
+            task = asyncio.create_task(original_check(self, None, ru, request_id))
+            exact_inflight[ru] = task
+        try:
+            result = await task
+        finally:
+            if exact_inflight.get(ru) is task and task.done():
+                exact_inflight.pop(ru, None)
+
         if result[0]:
             exact_cache[ru] = result
         return result
@@ -164,7 +172,7 @@ def install_registry_query_fallbacks() -> None:
 
         primary_ru = _GEMATOLOG_ABO_RU if kind in {"a", "b"} else _GEMATOLOG_RH_KELL_KIDD_RU
 
-        (primary_records, primary_error), (alt_records, alt_error) = await __import__("asyncio").gather(
+        (primary_records, primary_error), (alt_records, alt_error) = await asyncio.gather(
             exact_ru(self, primary_ru, request_id),
             exact_ru(self, _MEDIKLON_ABO_RH_KELL_RU, request_id),
         )

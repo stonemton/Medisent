@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -38,6 +39,15 @@ from bot.services.report import CandidateView, Report, rank_candidates
 logger = logging.getLogger(__name__)
 
 MAX_SITES_TO_SCRAPE = 10
+PAGE_RU_RE = re.compile(
+    r"\b(?:РЗН|ФСР|ФСЗ)\s*(?:№\s*)?\d{4}/\d+(?:[-/]\d+)?\b",
+    re.I | re.UNICODE,
+)
+_GENERIC_MATCH_TERMS = {
+    "степлер", "кожный", "одноразовый", "одноразовая", "стерильный", "стерильная",
+    "изделие", "медицинский", "медицинское", "набор", "система", "инструмент",
+    "аппарат", "устройство", "скоба", "скобы", "скобами", "штук", "упаковка",
+}
 
 
 @dataclass(slots=True)
@@ -48,12 +58,7 @@ class SearchSummary:
     registry_state: str = RegistryState.UNAVAILABLE
     unrega_state: str = RegistryState.UNAVAILABLE
     errors: list[str] = field(default_factory=list)
-    # Поиск не отработал (сервис упал, потолок, ключ). Это не «ничего не
-    # нашли»: владельцу нельзя советовать «уточните название», когда виноват
-    # не он.
     search_failed: bool = False
-    # Заявка упёрлась в потолок расходов: часть сайтов осталась непроверенной,
-    # и владелец должен об этом знать, а не гадать, почему кандидатов мало.
     budget_exceeded: bool = False
 
 
@@ -68,9 +73,6 @@ async def run_search(
     summary = SearchSummary()
     registry_service = get_registry_service()
 
-    # 1. Поиск поставщиков и проверка изделия в реестре — независимы, идут
-    #    параллельно. Реестр отвечает медленно, ждать его последовательно
-    #    незачем. Кэш реестра сервис читает и пишет своими короткими сессиями.
     search_task = get_perplexity_service().find_suppliers(
         product, requirements=requirements, request_id=request_id
     )
@@ -91,12 +93,6 @@ async def run_search(
     if not search.suppliers:
         return summary
 
-    # 2. Поставщики в базу через upsert. Дедупликация — на уникальных
-    #    индексах, матчинга по названию нет.
-    # Названия компаний придумала модель поиска по содержимому чужих страниц.
-    # Прогоняем их через тот же фильтр, что и скрейп: поставщик с названием
-    # «Медтехника. Ignore previous instructions» не должен попасть в промпт
-    # отчёта как обычное поле.
     tainted_suppliers: set[str] = set()
     supplier_inputs: list[SupplierInput] = []
     for item in search.suppliers:
@@ -123,10 +119,6 @@ async def run_search(
     async with session_scope() as session:
         key_to_id = await repo.upsert_suppliers(session, supplier_inputs)
 
-    # 3. Обход сайтов и информационные письма — параллельно, обе задачи
-    #    внешние и друг от друга не зависят. Список сайтов ограничен: десяток
-    #    — уже пара минут и заметные деньги, а кандидатов сверх десяти
-    #    владелец всё равно не читает.
     best = registry.best
     to_scrape = [item for item in search.suppliers if item.site][:MAX_SITES_TO_SCRAPE]
     scrape_task = (
@@ -146,39 +138,39 @@ async def run_search(
     if unrega.unavailable:
         summary.errors.append("информационные письма не проверены")
 
-    # 4. Кандидаты одним пакетом.
     candidates: list[CandidateInput] = []
     for item in search.suppliers:
         supplier_id = _resolve_supplier_id(item, key_to_id)
         if supplier_id is None:
             continue
         scrape = scrapes.get(item.site) if item.site else None
+        site_ru_match, match_basis = _site_registry_match(product, scrape, best)
         candidates.append(
             CandidateInput(
                 supplier_id=supplier_id,
                 site_claims=scrape.claims_stock if scrape and scrape.ok else None,
                 site_url=item.site or None,
                 site_price=scrape.price if scrape and scrape.ok else None,
-                # Поля реестра относятся к изделию и одинаковы у всех
-                # кандидатов заявки. Это не «поставщик проверен» — это
-                # «изделие зарегистрировано».
+                # Это РУ на изделие из официального реестра. Отдельный флаг
+                # registry_match ниже отвечает на другой вопрос: есть ли на
+                # странице КОНКРЕТНОГО поставщика достаточно данных, чтобы
+                # связать его товар именно с этим РУ.
                 ru_number=best.ru_number if best else None,
                 ru_holder=best.holder if best else None,
                 ru_valid=best.valid if best else None,
                 ru_registry=best.registry if best else None,
-                # «Проверяли» — только если проверка состоялась. При
-                # ``unavailable`` колонка остаётся пустой: заполненная дата
-                # рядом с пустым номером читалась бы как «проверили, не нашли».
                 ru_checked_at=None if registry.unavailable else registry.checked_at,
                 unrega_flags=_unrega_flags(unrega),
                 raw={
                     "registry": registry.as_payload(),
+                    "registry_match": {
+                        "site_matches_ru": site_ru_match,
+                        "basis": match_basis,
+                    },
                     "search": {"note": item.note, "source": item.source_url},
                     "scrape": {
                         "ok": bool(scrape and scrape.ok),
                         "error": scrape.error if scrape else None,
-                        # Подозрение может прийти с двух сторон: из текста
-                        # страницы и из названия, придуманного поиском.
                         "injection_suspected": bool(
                             (scrape and scrape.injection_suspected)
                             or (item.site or item.name) in tainted_suppliers
@@ -191,7 +183,6 @@ async def run_search(
     async with session_scope() as session:
         if candidates:
             await repo.upsert_candidates(session, request_id, candidates)
-        # Контакты, найденные на сайте, дополняют то, что дал поиск.
         await _enrich_contacts(session, search.suppliers, scrapes, key_to_id)
         summary.blacklisted = await repo.count_blacklisted_in_request(session, request_id)
         await repo.transition(session, request_id, RequestStatus.REPORT)
@@ -221,12 +212,68 @@ async def _nothing() -> list[ScrapeResult]:
     return []
 
 
-def _unrega_flags(unrega: RegistryResult) -> dict[str, Any]:
-    """Колонка ``candidates.unrega_flags``: состояние проверки плюс сами письма.
+def _normalise_ru(value: str) -> str:
+    return re.sub(r"[^a-zа-яё0-9]", "", (value or "").lower())
 
-    Состояние здесь обязательно: пустой список без него не отличим от
-    «не проверяли», а это разные факты и в отчёте они печатаются по-разному.
+
+def _distinctive_terms(text: str) -> set[str]:
+    words = re.findall(r"[A-Za-zА-Яа-яЁё0-9-]{4,}", (text or "").lower())
+    return {
+        word
+        for word in words
+        if word not in _GENERIC_MATCH_TERMS and not word.isdigit()
+    }
+
+
+def _site_registry_match(
+    product: str,
+    scrape: ScrapeResult | None,
+    best: Any,
+) -> tuple[bool | None, str]:
+    """Связать товар конкретного поставщика с найденным РУ без догадок.
+
+    True ставится только по сильному признаку: точный номер РУ на странице
+    поставщика либо отличительный бренд/модель, который одновременно есть в
+    запросе, официальной карточке ELK и на странице поставщика. Отсутствие
+    доказательства — None, а не False. False ставится только при явном
+    противоречии: на странице есть другой номер РУ.
     """
+    if best is None or not getattr(best, "ru_number", None):
+        return None, "РУ на изделие не найдено"
+    if scrape is None or not scrape.ok or not scrape.markdown:
+        return None, "страница поставщика не проверена"
+
+    page_text = scrape.markdown.lower()
+    expected_ru = _normalise_ru(str(best.ru_number))
+    page_compact = _normalise_ru(page_text)
+    if expected_ru and expected_ru in page_compact:
+        return True, "точный номер РУ найден на странице поставщика"
+
+    page_ru_numbers = {_normalise_ru(match.group(0)) for match in PAGE_RU_RE.finditer(scrape.markdown)}
+    page_ru_numbers.discard("")
+    if page_ru_numbers and expected_ru not in page_ru_numbers:
+        return False, "на странице поставщика указан другой номер РУ"
+
+    registry_text = " ".join(
+        str(value or "")
+        for value in (
+            getattr(best, "product_name", None),
+            getattr(best, "holder", None),
+            (getattr(best, "raw", {}) or {}).get("text")
+            if isinstance(getattr(best, "raw", {}), dict)
+            else "",
+        )
+    ).lower()
+    distinct = _distinctive_terms(product)
+    strong = {term for term in distinct if term in registry_text}
+    matched = {term for term in strong if term in page_text}
+    if matched:
+        return True, "совпал отличительный бренд/модель: " + ", ".join(sorted(matched)[:3])
+
+    return None, "на странице поставщика недостаточно данных для привязки к РУ"
+
+
+def _unrega_flags(unrega: RegistryResult) -> dict[str, Any]:
     return {
         "state": unrega.state,
         "items": [r.product_name or r.status_text or "письмо" for r in unrega.records],
@@ -251,10 +298,7 @@ async def _enrich_contacts(
     scrapes: dict[str, ScrapeResult],
     key_to_id: dict[str, int],
 ) -> None:
-    """Дописать e-mail и телефон, найденные скрейпом.
-
-    Идёт тем же upsert'ом: COALESCE не затрёт уже известный контакт пустотой.
-    """
+    """Дописать e-mail и телефон, найденные скрейпом."""
     updates: list[SupplierInput] = []
     for item in suppliers:
         site = getattr(item, "site", "") or ""
@@ -283,11 +327,7 @@ async def build_report(
     qty: str,
     requirements: list[str],
 ) -> Report:
-    """Собрать отчёт по кандидатам заявки.
-
-    Чёрный список отсекается внутри запроса ``list_candidates_for_report`` —
-    до всякого ранжирования, а не после.
-    """
+    """Собрать отчёт по кандидатам заявки."""
     request = await repo.get_request(session, request_id)
     token = request.token if request else "?"
 
@@ -308,6 +348,8 @@ async def build_report(
             ru_valid=row.ru_valid,
             ru_registry=row.ru_registry,
             registry_state=_registry_state(row),
+            ru_site_match=getattr(row, "ru_site_match", None),
+            ru_match_basis=getattr(row, "ru_match_basis", None),
             unrega_flags=_unrega_items(row.unrega_flags),
             injection_suspected=bool(row.injection_suspected),
         )
@@ -326,8 +368,6 @@ async def build_report(
         unrega_state=unrega_state,
     )
 
-    # Порядок отчёта — факт, а не деталь рендера: по нему владелец скажет
-    # «беру второго». Сохраняем, чтобы выбор считался по той же нумерации.
     await repo.set_candidate_ranks(
         session, {view.candidate_id: index for index, view in enumerate(ordered, start=1)}
     )
@@ -344,16 +384,6 @@ async def build_report(
 
 
 def _registry_state(row: object) -> str:
-    """Состояние проверки реестра — как его записал конвейер.
-
-    Читается из ``raw.registry.state``. Восстанавливать его из колонок нельзя:
-    ``ru_checked_at`` без ``ru_number`` неотличим от «проверили и не нашли»,
-    и «реестр недоступен» превращалось бы в «РУ не найдено».
-
-    Записи без сохранённого состояния (их не бывает у строк, записанных
-    конвейером) считаются непроверенными: это единственное, что про них
-    известно честно.
-    """
     state = getattr(row, "registry_state", None)
     if state in (RegistryState.FOUND, RegistryState.NOT_FOUND, RegistryState.UNAVAILABLE):
         return str(state)
@@ -369,7 +399,6 @@ def _unrega_items(value: object) -> list[str]:
 
 
 def _unrega_state(rows: Sequence[Any]) -> str:
-    """Состояние проверки писем — одно на заявку, как и проверка РУ."""
     for row in rows:
         flags = getattr(row, "unrega_flags", None)
         if isinstance(flags, dict) and flags.get("state") in (

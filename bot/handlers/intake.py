@@ -16,6 +16,7 @@ from bot.db import repo
 from bot.db.session import session_scope
 from bot.handlers.common import download
 from bot.pipeline import build_report, close_request, run_search
+from bot.services.agent import plan_procurement_next
 from bot.services.batch_intake import (
     ProcurementBatch,
     ProcurementItem,
@@ -60,6 +61,14 @@ def _registry_alternatives(record: object) -> list[dict[str, object]]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, dict)]
+
+
+def _agent_decision(record: object) -> dict[str, object]:
+    raw = getattr(record, "raw", None)
+    if not isinstance(raw, dict):
+        return {}
+    value = raw.get("agent_decision")
+    return dict(value) if isinstance(value, dict) else {}
 
 
 def _alternate_ru_lines(record: object, *, indent: str = "") -> list[str]:
@@ -164,6 +173,23 @@ async def _start_pipeline(message: Message, parsed: ProductRequest, input_kind: 
             "Уточните наименование/модель или пришлите РУ."
         )
         return
+
+    agent_meta = _agent_decision(best)
+    needs_review = bool(agent_meta.get("needs_review"))
+    try:
+        agent_confidence = float(agent_meta.get("confidence", 1.0) or 0.0)
+    except (TypeError, ValueError):
+        agent_confidence = 0.0
+    if needs_review and agent_confidence < 0.70:
+        reason = str(agent_meta.get("reasoning") or "между найденными РУ остаётся существенная неоднозначность")
+        await message.answer(
+            "⚠️ Нашёл несколько похожих регистрационных вариантов, но не хочу выбирать наугад.\n\n"
+            f"{texts.esc(reason)}\n\n"
+            "Пришлите точное наименование, модель/артикул или номер РУ — после этого продолжу поиск поставщиков.",
+            parse_mode="HTML",
+        )
+        return
+
     status = "действует" if best.valid is True else (
         "не действует" if best.valid is False else "статус не определён"
     )
@@ -177,6 +203,8 @@ async def _start_pipeline(message: Message, parsed: ProductRequest, input_kind: 
     alternatives = _alternate_ru_lines(best)
     if alternatives:
         parts.extend(["", *alternatives])
+    if agent_meta.get("reasoning"):
+        parts.extend(["", "🧠 " + texts.esc(str(agent_meta.get("reasoning")))])
     parts.extend([
         "",
         "Основным считаю РУ выше. Изделия под другим РУ показываю только как альтернативные совпадения — не смешиваю производителей автоматически.",
@@ -232,7 +260,7 @@ async def _start_batch(message: Message, batch: ProcurementBatch, input_kind: st
 
     await message.answer(
         "🔎 Проверяю каждую позицию по реестру Росздравнадзора. "
-        "После этого объединю поиск по общим каналам закупки."
+        "После этого агент оценит список целиком и решит, можно ли безопасно переходить к поставщикам."
     )
     service = get_registry_service()
     checks = await asyncio.gather(
@@ -244,15 +272,35 @@ async def _start_batch(message: Message, batch: ProcurementBatch, input_kind: st
 
     lines = ["<b>Проверка позиций по РУ</b>", ""]
     unresolved: list[ProcurementItem] = []
+    workflow_items: list[dict[str, object]] = []
     for index, (item, registry) in enumerate(zip(items, checks, strict=True), start=1):
         best = registry.best
         if best is None:
             unresolved.append(item)
+            workflow_items.append({
+                "index": index,
+                "product": item.product,
+                "unresolved": True,
+                "needs_review": True,
+            })
             lines.append(f"⚠️ {index}. {texts.esc(item.product)} — РУ уверенно не найдено")
             continue
         status = "действует" if best.valid is True else (
             "не действует" if best.valid is False else "статус не определён"
         )
+        agent_meta = _agent_decision(best)
+        workflow_items.append({
+            "index": index,
+            "product": item.product,
+            "ru_number": best.ru_number,
+            "holder": best.holder,
+            "valid": best.valid,
+            "unresolved": False,
+            "needs_review": bool(agent_meta.get("needs_review")),
+            "agent_confidence": agent_meta.get("confidence"),
+            "agent_reasoning": agent_meta.get("reasoning"),
+            "alternatives": _registry_alternatives(best),
+        })
         lines.append(
             f"✅ {index}. {texts.esc(item.product)}\n"
             f"   РУ: <b>{texts.esc(best.ru_number or '—')}</b> · {status}\n"
@@ -261,18 +309,27 @@ async def _start_batch(message: Message, batch: ProcurementBatch, input_kind: st
         lines.extend(_alternate_ru_lines(best, indent="   "))
     await _send_chunks(message, lines, parse_mode="HTML")
 
-    if unresolved:
-        async with session_scope() as session:
-            await close_request(session, request_id)
+    workflow = await plan_procurement_next(
+        stage="registry_review",
+        state={"items": workflow_items, "total_items": len(items)},
+        request_id=request_id,
+    )
+
+    if unresolved or workflow.action == "ask_clarification":
+        question = workflow.clarification_question or (
+            "Уточните спорные позиции: пришлите точное наименование, модель/артикул или номер РУ."
+        )
         await message.answer(
-            "Поиск поставщиков не запускаю: по части списка нет уверенной идентификации РУ. "
-            "Уточните эти позиции или пришлите их РУ — так бот не закупит похожее изделие вместо нужного."
+            f"🧠 {texts.esc(workflow.user_message)}\n\n{texts.esc(question)}",
+            parse_mode="HTML",
         )
         return
 
     await message.answer(
-        "Все позиции идентифицированы. Если найдены совпадающие изделия под другими РУ, они показаны выше как альтернативы и не подменяют основной выбор. "
+        f"🧠 {texts.esc(workflow.user_message)}\n\n"
+        "Если найдены совпадающие изделия под другими РУ, они остаются альтернативами и не подменяют основной выбор. "
         "Искать производителя и поставщиков сразу по всему списку?",
+        parse_mode="HTML",
         reply_markup=_batch_keyboard(request_id).as_markup(),
     )
 
@@ -337,14 +394,29 @@ async def batch_confirm(callback: CallbackQuery) -> None:
     items = batch.recognised_items
     await callback.message.answer(
         f"🔎 Запускаю закупочный поиск по {len(items)} позициям. "
-        "Сначала проверю каждую позицию отдельно, затем оставлю только поставщиков, "
-        "которые реально закрывают весь список."
+        "Ищу прямого производителя/держателя РУ, официальных дистрибьюторов и продавцов, "
+        "а затем агент оценит результат целиком."
     )
     result = await run_batch_procurement(
         master_request_id=request_id,
         items=items,
         master_product=request.product,
     )
+    workflow = await plan_procurement_next(
+        stage="supplier_search",
+        state={
+            "total_items": len(items),
+            "full_coverage": result.report is not None,
+            "full_coverage_suppliers": result.full_coverage_suppliers,
+            "split_plan": [
+                {"supplier": row.supplier_name, "covered_items": row.covered_items}
+                for row in result.split_plan
+            ],
+            "errors": result.errors,
+        },
+        request_id=request_id,
+    )
+
     if result.report is not None:
         await callback.message.answer(
             f"✅ Нашёл поставщиков с подтверждённым покрытием всех {len(items)} позиций: "
@@ -352,6 +424,8 @@ async def batch_confirm(callback: CallbackQuery) -> None:
         )
         for chunk in render(result.report):
             await callback.message.answer(chunk, parse_mode="HTML", disable_web_page_preview=True)
+        if workflow.user_message:
+            await callback.message.answer("🧠 " + workflow.user_message)
         return
 
     if result.split_plan:
@@ -368,6 +442,7 @@ async def batch_confirm(callback: CallbackQuery) -> None:
             lines.extend(["", "Ошибки отдельных проходов: " + texts.esc("; ".join(result.errors))])
         await _send_chunks(callback.message, lines, parse_mode="HTML")
         await callback.message.answer(
+            "🧠 " + workflow.user_message + "\n\n"
             "Общий запрос КП специально не создаю: иначе поставщику ушли бы позиции, "
             "по которым его товар не подтверждён."
         )

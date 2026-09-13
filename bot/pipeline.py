@@ -67,11 +67,19 @@ async def run_search(
     summary = SearchSummary()
     registry_service = get_registry_service()
 
-    search_task = get_perplexity_service().find_suppliers(
-        product, requirements=requirements, request_id=request_id
+    # Search v2 сначала получает официальные признаки изделия из реестра, а затем
+    # использует их как поисковые якоря: номер РУ и держателя/производителя.
+    registry = await registry_service.check_product(
+        product, request_id=request_id, cache=True
     )
-    registry_task = registry_service.check_product(product, request_id=request_id, cache=True)
-    search, registry = await asyncio.gather(search_task, registry_task)
+    best = registry.best
+    search = await get_perplexity_service().find_suppliers(
+        product,
+        requirements=requirements,
+        ru_number=best.ru_number if best else None,
+        holder=best.holder if best else None,
+        request_id=request_id,
+    )
 
     summary.registry_state = registry.state
     if not search.ok:
@@ -113,7 +121,6 @@ async def run_search(
     async with session_scope() as session:
         key_to_id = await repo.upsert_suppliers(session, supplier_inputs)
 
-    best = registry.best
     to_scrape = [item for item in search.suppliers if item.site][:MAX_SITES_TO_SCRAPE]
     scrape_task = (
         get_firecrawl_service().scrape_many(
@@ -150,9 +157,6 @@ async def run_search(
                 ru_valid=best.valid if best else None,
                 ru_registry=best.registry if best else None,
                 ru_checked_at=None if registry.unavailable else registry.checked_at,
-                # Поле уже JSON, поэтому сохраняем здесь и состояние писем, и
-                # отдельную привязку товара поставщика к найденному РУ — без
-                # миграции схемы БД.
                 unrega_flags=_unrega_flags(
                     unrega,
                     ru_site_match=site_ru_match,

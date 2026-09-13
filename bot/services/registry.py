@@ -22,7 +22,15 @@ logger = logging.getLogger(__name__)
 Outcome = tuple[list[RegistryRecord], str | None]
 
 FIRECRAWL_SEARCH_URL = "https://api.firecrawl.dev/v2/search"
-ELK_CARD_RE = re.compile(r"^https://elk\.roszdravnadzor\.gov\.ru/widget/med-product/(\d+)(?:[/?#].*)?$", re.I)
+FIRECRAWL_SCRAPE_URL = "https://api.firecrawl.dev/v1/scrape"
+ELK_CARD_RE = re.compile(
+    r"^https://elk\.roszdravnadzor\.gov\.ru/widget/med-product/(\d+)(?:[/?#].*)?$",
+    re.I,
+)
+RU_NUMBER_RE = re.compile(
+    r"\b(?:РЗН|ФСР|ФСЗ)\s*(?:№\s*)?\d{4}/\d+(?:[-/]\d+)?\b",
+    re.I | re.UNICODE,
+)
 
 
 def derive_state(outcomes: Sequence[Outcome]) -> str:
@@ -94,14 +102,14 @@ def _record_matches_query(record: RegistryRecord, query: str) -> bool:
     terms = _significant_terms(query)
     if not terms:
         return False
+    raw_text = ""
+    if isinstance(record.raw, dict):
+        raw_text = str(record.raw.get("text") or "")
+        cells = record.raw.get("cells") or []
+        if isinstance(cells, list):
+            raw_text += " " + " ".join(str(x) for x in cells)
     haystack = " ".join(
-        str(x or "")
-        for x in (
-            record.product_name,
-            record.holder,
-            record.ru_number,
-            " ".join(record.raw.get("cells", [])) if isinstance(record.raw, dict) else "",
-        )
+        str(x or "") for x in (record.product_name, record.holder, record.ru_number, raw_text)
     ).lower()
     hits = sum(1 for term in set(terms) if term in haystack)
     return hits >= (1 if len(set(terms)) <= 2 else 2)
@@ -115,7 +123,6 @@ def _clean_md_value(value: str | None) -> str | None:
 
 
 def _field_after_label(text: str, *labels: str) -> str | None:
-    """Берёт значение после подписи поля на официальной карточке ELK."""
     for label in labels:
         escaped = re.escape(label)
         patterns = (
@@ -133,16 +140,26 @@ def _parse_elk_card_text(text: str, url: str, query: str) -> RegistryRecord | No
     ru_number = _field_after_label(
         text,
         "Регистрационный номер медицинского изделия",
+        "Регистрационный номер",
         "Номер ЕРУЛ",
     )
-    product_name = _field_after_label(text, "Наименование медицинского изделия")
-    status_text = _field_after_label(text, "Статус")
+    if not ru_number:
+        match = RU_NUMBER_RE.search(text)
+        ru_number = match.group(0).strip() if match else None
+
+    product_name = _field_after_label(
+        text,
+        "Наименование медицинского изделия",
+        "Наименование изделия",
+    )
+    status_text = _field_after_label(text, "Статус", "Статус регистрационного удостоверения")
     holder = _field_after_label(
         text,
         "Наименования организации - уполномоченного представителя производителя (изготовителя) медицинского изделия",
         "Наименование организации - уполномоченного представителя производителя (изготовителя) медицинского изделия",
         "Наименования организации - производителя медицинского изделия или организации - изготовителя медицинского изделия",
         "Наименование организации - производителя медицинского изделия или организации - изготовителя медицинского изделия",
+        "Заявитель",
     )
 
     if not ru_number and not product_name:
@@ -165,7 +182,7 @@ def _parse_elk_card_text(text: str, url: str, query: str) -> RegistryRecord | No
         valid=valid,
         status_text=status_text,
         card_url=url,
-        raw={"source": "official_elk_page", "text": text[:10000]},
+        raw={"source": "official_elk_page", "text": text[:20000]},
     )
     return record if _record_matches_query(record, query) else None
 
@@ -195,10 +212,40 @@ class RegistryService:
         await self._client.aclose()
         await self._firecrawl.aclose()
 
+    async def _scrape_elk_card(
+        self, url: str, *, request_id: int | None = None
+    ) -> tuple[str, str | None]:
+        """Загружает именно найденную официальную карточку ELK целиком."""
+        result = await self._firecrawl.post(
+            FIRECRAWL_SCRAPE_URL,
+            operation="elk.card_scrape",
+            request_id=request_id,
+            cost_usd=pricing.flat_cost("firecrawl"),
+            json={
+                "url": url,
+                "formats": ["markdown"],
+                "onlyMainContent": False,
+                "waitFor": 5000,
+                "timeout": 60000,
+            },
+        )
+        if not result.ok:
+            return "", result.error or "карточка ELK не загрузилась"
+        payload = (result.json or {}).get("data") or {}
+        if not isinstance(payload, dict):
+            return "", "Firecrawl вернул карточку ELK в неизвестном формате"
+        metadata = payload.get("metadata") or {}
+        title = str(metadata.get("title") or "") if isinstance(metadata, dict) else ""
+        description = str(metadata.get("description") or "") if isinstance(metadata, dict) else ""
+        markdown = str(payload.get("markdown") or "")
+        text = "\n".join((title, description, markdown)).strip()
+        if not text:
+            return "", "карточка ELK пустая"
+        return text, None
+
     async def _check_elk(
         self, name: str | None, ru_number: str | None, request_id: int | None
     ) -> tuple[list[RegistryRecord], str | None]:
-        """Проверяет РУ по официальным публичным карточкам ELK."""
         if not self._settings.firecrawl_api_key:
             return [], "для проверки официальных карточек ELK нужен FIRECRAWL_API_KEY"
 
@@ -219,10 +266,6 @@ class RegistryService:
                 "country": "RU",
                 "timeout": 60000,
                 "ignoreInvalidURLs": True,
-                "scrapeOptions": {
-                    "formats": [{"type": "markdown"}],
-                    "onlyMainContent": True,
-                },
             },
         )
         if not result.ok:
@@ -232,104 +275,49 @@ class RegistryService:
         data = payload.get("data") or {}
         rows = data.get("web") if isinstance(data, dict) else None
         if not isinstance(rows, list):
-            logger.warning(
-                "ELK diagnostic: query=%r, data_type=%s, data_keys=%s, payload_keys=%s",
-                query,
-                type(data).__name__,
-                list(data.keys()) if isinstance(data, dict) else [],
-                list(payload.keys()) if isinstance(payload, dict) else [],
-                extra=log_extra(request_id),
-            )
             return [], "Firecrawl не вернул список официальных карточек ELK"
 
-        logger.info(
-            "ELK diagnostic: query=%r, rows=%s",
-            query,
-            len(rows),
-            extra=log_extra(request_id),
-        )
+        logger.info("ELK: поиск по «%s» вернул %s результатов", query, len(rows), extra=log_extra(request_id))
 
         records: list[RegistryRecord] = []
+        errors: list[str] = []
         seen_urls: set[str] = set()
-        for index, row in enumerate(rows, start=1):
+        for row in rows:
             if not isinstance(row, dict):
-                logger.info(
-                    "ELK diagnostic row %s: не объект (%s)",
-                    index,
-                    type(row).__name__,
-                    extra=log_extra(request_id),
-                )
                 continue
-
             url = str(row.get("url") or "").strip()
-            title = str(row.get("title") or "").strip()
-            description = str(row.get("description") or "").strip()
-            markdown = str(row.get("markdown") or "")
-            official_url = bool(ELK_CARD_RE.match(url))
-
-            logger.info(
-                "ELK diagnostic row %s: url=%r official=%s title=%r markdown_len=%s keys=%s",
-                index,
-                url[:300],
-                official_url,
-                title[:180],
-                len(markdown),
-                sorted(row.keys()),
-                extra=log_extra(request_id),
-            )
-
-            if not official_url:
-                continue
-            if url in seen_urls:
-                logger.info(
-                    "ELK diagnostic row %s: дубль URL, пропуск",
-                    index,
-                    extra=log_extra(request_id),
-                )
+            if not ELK_CARD_RE.match(url) or url in seen_urls:
                 continue
             seen_urls.add(url)
 
-            text = "\n".join((title, description, markdown))
-            ru_found = _field_after_label(
-                text,
-                "Регистрационный номер медицинского изделия",
-                "Номер ЕРУЛ",
-            )
-            product_found = _field_after_label(text, "Наименование медицинского изделия")
+            # Search отдаёт только короткий сниппет карточки (в нашем случае ~127
+            # символов). Поэтому после обнаружения официального URL всегда
+            # скрейпим саму карточку целиком и только её считаем источником РУ.
+            full_text, scrape_error = await self._scrape_elk_card(url, request_id=request_id)
+            if scrape_error:
+                errors.append(f"{url}: {scrape_error}")
+                logger.warning("ELK: карточка %s не загрузилась: %s", url, scrape_error, extra=log_extra(request_id))
+                continue
+
+            record = _parse_elk_card_text(full_text, url, query)
             logger.info(
-                "ELK diagnostic row %s: extracted_ru=%r extracted_product=%r text_preview=%r",
-                index,
-                ru_found,
-                product_found[:180] if product_found else None,
-                re.sub(r"\s+", " ", text)[:350],
+                "ELK: карточка %s len=%s ru=%r product=%r",
+                url,
+                len(full_text),
+                record.ru_number if record else None,
+                (record.product_name[:160] if record and record.product_name else None),
                 extra=log_extra(request_id),
             )
-
-            record = _parse_elk_card_text(text, url, query)
             if record is not None:
                 records.append(record)
-                logger.info(
-                    "ELK diagnostic row %s: карточка принята",
-                    index,
-                    extra=log_extra(request_id),
-                )
-            else:
-                logger.info(
-                    "ELK diagnostic row %s: карточка отброшена (поля не извлечены или нет совпадения с запросом)",
-                    index,
-                    extra=log_extra(request_id),
-                )
 
         if records:
-            logger.info(
-                "ELK: по «%s» подтверждено официальных карточек %s",
-                query,
-                len(records),
-                extra=log_extra(request_id),
-            )
+            logger.info("ELK: по «%s» подтверждено карточек %s", query, len(records), extra=log_extra(request_id))
             return records, None
 
-        return [], "официальная карточка ELK не найдена или её поля не удалось подтвердить"
+        if errors:
+            return [], "официальные карточки ELK найдены, но не загрузились/не разобрались: " + "; ".join(errors[:3])
+        return [], "официальная карточка ELK найдена поиском, но РУ из неё извлечь не удалось"
 
     async def _check_misearch(
         self, name: str | None, ru_number: str | None, request_id: int | None

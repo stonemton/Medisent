@@ -182,6 +182,29 @@ def _holder_from_context(text: str) -> str | None:
     return matches[0] if len(matches) == 1 else None
 
 
+def _holder_debug_context(text: str) -> str:
+    """Безопасный компактный фрагмент карточки для диагностики подписи держателя."""
+    markers = (
+        "держател", "заявител", "производител", "организац", "юридическ",
+        "уполномоченн", "изготовител", "регистрационное удостоверение",
+    )
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+    chunks: list[str] = []
+    seen: set[str] = set()
+    for index, line in enumerate(lines):
+        if not line or not any(marker in line.lower() for marker in markers):
+            continue
+        start = max(0, index - 1)
+        end = min(len(lines), index + 4)
+        chunk = " || ".join(x for x in lines[start:end] if x)
+        if chunk and chunk not in seen:
+            seen.add(chunk)
+            chunks.append(chunk[:700])
+        if len(chunks) >= 4:
+            break
+    return " /// ".join(chunks)[:2600]
+
+
 def _parse_elk_card_text(text: str, url: str, query: str) -> RegistryRecord | None:
     ru_number = _field_after_label(
         text,
@@ -365,6 +388,14 @@ class RegistryService:
                 (record.product_name[:160] if record and record.product_name else None),
                 extra=log_extra(request_id),
             )
+            if record is not None and not record.holder:
+                context = _holder_debug_context(full_text)
+                logger.info(
+                    "ELK holder context %s: %s",
+                    url,
+                    context or "подходящих строк в markdown не найдено",
+                    extra=log_extra(request_id),
+                )
             if record is not None:
                 records.append(record)
 

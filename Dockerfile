@@ -20,10 +20,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 FROM base AS runtime
 
-# Системный CA-bundle нужен в том числе для государственных HTTPS-сервисов
-# с цепочкой сертификатов, которую минимальный Python-образ сам не содержит.
+# Росздравнадзор использует российскую цепочку сертификатов Минцифры.
+# Обычного Debian CA-bundle для неё недостаточно, поэтому добавляем
+# корневой и выпускающие RSA-сертификаты в системное хранилище. Проверка TLS
+# остаётся включённой — verify=False нигде не используется.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && mkdir -p /usr/local/share/ca-certificates/russian-trusted \
+    && curl -fsSL https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt \
+        -o /usr/local/share/ca-certificates/russian-trusted/russian_trusted_root_ca.crt \
+    && curl -fsSL https://gu-st.ru/content/lending/russian_trusted_sub_ca_pem.crt \
+        -o /usr/local/share/ca-certificates/russian-trusted/russian_trusted_sub_ca.crt \
+    && curl -fsSL https://gu-st.ru/content/lending/russian_trusted_sub_ca_2024_pem.crt \
+        -o /usr/local/share/ca-certificates/russian-trusted/russian_trusted_sub_ca_2024.crt \
     && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

@@ -1,10 +1,4 @@
-"""Распознавание многопозиционных закупочных заявок.
-
-Для фото и файлов используем два прохода Gemini: сначала строгий structured output,
-затем более терпимый JSON-проход, если провайдер/модель не приняла responseSchema
-или таблица сложная. Обычный ProductRequest остаётся совместимым с одиночным
-сценарием.
-"""
+"""Распознавание многопозиционных закупочных заявок."""
 from __future__ import annotations
 
 import json
@@ -12,9 +6,16 @@ import logging
 import re
 from dataclasses import dataclass, field
 
+from bot.logging_setup import log_extra
 from bot.services.gemini import GeminiError, Part, get_gemini_service
 
 logger = logging.getLogger(__name__)
+
+# Для vision не используем общий alias из окружения. В сентябре 2026 стабильная
+# production-модель Gemini 3.8 Flash нативно принимает Image/PDF и поддерживает
+# structured outputs. Это устраняет зависимость от устаревших alias вида
+# gemini-flash-latest, которые могут вести на модель без нужной multimodal-схемы.
+VISION_MODEL = "gemini-3.8-flash"
 
 
 @dataclass(slots=True)
@@ -80,38 +81,31 @@ BATCH_SCHEMA = {
     "required": ["items", "confidence"],
 }
 
-BATCH_INSTRUCTION = """Ты — модуль распознавания закупочной заявки медицинских изделий.
-Твоя задача — читать изображение/документ как таблицу, а не угадывать один общий товар.
+BATCH_INSTRUCTION = """Ты профессиональный закупщик медицинских изделий и читаешь фотографию/скриншот таблицы.
+Твоя задача — НЕ угадывать одно изделие, а извлечь ВСЕ товарные строки таблицы.
 
-Верни КАЖДУЮ товарную позицию отдельным элементом items. Не объединяй разные
-реагенты, размеры, артикулы, фасовки или исполнения. Сохраняй максимально точно
-видимое название, марку/артикул/модель, фасовку, объём и концентрацию. Количество
-и единицу измерения вынеси отдельно. Если количество находится в крайнем правом
-столбце — обязательно свяжи его с товаром той же строки.
+Для каждой строки товара верни отдельный объект:
+- product: точное читаемое наименование, включая Анти-A/Анти-B/Анти-D/Анти-Kell, Super/Супер, объем флакона, концентрацию, артикул или исполнение, если они видны;
+- qty: количество из той же строки;
+- unit: единица измерения;
+- requirements: остальные явно видимые требования;
+- confidence: уверенность 0..1.
 
-Игнорируй номера строк, номера колонок, заголовки, служебные колонки, итоги,
-единицу измерения как отдельный товар. Не придумывай отсутствующие сведения.
-Если текст читается неидеально, всё равно верни различимые позиции и понизь confidence.
-Если позиция одна — верни массив из одного элемента.
-
-Ответ только JSON вида:
-{"items":[{"product":"...","qty":"100","unit":"флак","requirements":[],"confidence":0.95}],"confidence":0.95,"transcript":"кратко что было видно"}
+Критично: количество часто находится в крайнем правом столбце. Сопоставляй его со строкой по горизонтали.
+Не считай заголовки, номер строки, номер колонки и итог отдельным товаром. Не объединяй разные реагенты в одну позицию.
+Если часть текста читается плохо, всё равно верни все различимые позиции и понизь confidence. Не отвечай общей фразой «не удалось определить изделие».
 """
 
-VISION_USER_PROMPT = """Проанализируй приложенное изображение/файл именно как закупочную таблицу.
-Сначала мысленно прочитай строки слева направо, затем верни все товарные позиции.
-Особенно внимательно проверь крайний правый столбец количества. Не отвечай фразой
-«не могу определить изделие»: если видны несколько строк товара, перечисли их все."""
+VISION_USER_PROMPT = """Прочитай изображение как таблицу закупки. Сначала определи границы строк, затем для каждой строки прочитай левый столбец с наименованием и правый столбец с количеством. Верни все строки товара. Проверь количество строк дважды перед ответом."""
 
 _QTY_TAIL_RE = re.compile(
-    r"(?P<qty>\d[\d\s]*(?:[.,]\d+)?)\s*(?P<unit>фл\.?|флакон(?:а|ов)?|шт\.?|штук(?:а|и)?|уп\.?|упаков(?:ка|ки|ок)|компл\.?|комплект(?:а|ов)?)\s*$",
+    r"(?P<qty>\d[\d\s]*(?:[.,]\d+)?)\s*(?P<unit>фл\.?|флак\.?|флакон(?:а|ов)?|шт\.?|штук(?:а|и)?|уп\.?|упаков(?:ка|ки|ок)|компл\.?|комплект(?:а|ов)?)\s*$",
     re.IGNORECASE,
 )
 _NUMBERING_RE = re.compile(r"^\s*(?:\d+[.)]|[-•])\s*")
 
 
 def parse_text_batch(text: str) -> ProcurementBatch:
-    """Локальный разбор многострочного списка без LLM."""
     raw_lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
     items: list[ProcurementItem] = []
     for raw in raw_lines:
@@ -174,12 +168,10 @@ async def _vision_attempt(
 ) -> ProcurementBatch:
     service = get_gemini_service()
     parsed = await service.generate_json(
-        parts=[
-            Part(text=VISION_USER_PROMPT),
-            Part(data=content, mime_type=mime_type),
-        ],
+        parts=[Part(text=VISION_USER_PROMPT), Part(data=content, mime_type=mime_type)],
         system_instruction=BATCH_INSTRUCTION,
         schema=BATCH_SCHEMA if strict_schema else None,
+        model=VISION_MODEL,
         request_id=request_id,
         operation="intake.batch.strict" if strict_schema else "intake.batch.retry",
         temperature=0.0,
@@ -196,35 +188,38 @@ async def parse_media_batch(
     mime_type: str,
     request_id: int | None = None,
 ) -> ProcurementBatch:
-    """Распознать таблицу с автоматическим вторым проходом.
+    """Два независимых vision-прохода Gemini 3.8 Flash.
 
-    Первый проход использует responseSchema. Если API/модель отказали либо JSON
-    оказался пустым, повторяем без schema, но с тем же жёстким JSON-инструктажем.
-    Это заметно устойчивее на скриншотах таблиц из Telegram.
+    Первый — со строгой схемой. Второй — без responseSchema, если первый упал.
+    Если оба не сработали, наружу уходит подробная безопасная причина для логов.
     """
-    first_error: GeminiError | None = None
-    try:
-        return await _vision_attempt(
-            content,
-            mime_type=mime_type,
-            request_id=request_id,
-            strict_schema=True,
-        )
-    except GeminiError as exc:
-        first_error = exc
-        logger.warning("Строгий vision-разбор не удался: %s; запускаю retry", exc)
-
-    try:
-        return await _vision_attempt(
-            content,
-            mime_type=mime_type,
-            request_id=request_id,
-            strict_schema=False,
-        )
-    except GeminiError as retry_error:
-        raise GeminiError(
-            f"оба vision-прохода не удались: strict={first_error}; retry={retry_error}"
-        ) from retry_error
+    errors: list[str] = []
+    for strict in (True, False):
+        try:
+            batch = await _vision_attempt(
+                content,
+                mime_type=mime_type,
+                request_id=request_id,
+                strict_schema=strict,
+            )
+            logger.info(
+                "Vision batch: распознано %s позиций, model=%s strict=%s",
+                len(batch.recognised_items),
+                VISION_MODEL,
+                strict,
+                extra=log_extra(request_id),
+            )
+            return batch
+        except GeminiError as exc:
+            errors.append(str(exc))
+            logger.warning(
+                "Vision batch failed model=%s strict=%s: %s",
+                VISION_MODEL,
+                strict,
+                exc,
+                extra=log_extra(request_id),
+            )
+    raise GeminiError("; ".join(errors) or "vision не вернул позиции")
 
 
 def serialise_batch(batch: ProcurementBatch) -> str:

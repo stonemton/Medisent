@@ -447,26 +447,47 @@ class RegistryService:
                 cached = await repo.get_registry_cache(own, key, self._settings.registry_cache_days)
 
         if cached is not None:
-            payload = cached.payload
-            return RegistryResult(
-                state=cached.state,
-                records=[
-                    RegistryRecord(
-                        registry=r.get("registry", "?"),
-                        ru_number=r.get("ru_number"),
-                        holder=r.get("holder"),
-                        product_name=r.get("product_name"),
-                        valid=r.get("valid"),
-                        status_text=r.get("status_text"),
-                        card_url=r.get("card_url"),
-                        raw={},
-                    )
-                    for r in payload.get("records", [])
-                ],
-                checked_at=cached.checked_at,
-                errors=payload.get("errors", {}),
-                from_cache=True,
+            payload = cached.payload if isinstance(cached.payload, dict) else {}
+            cached_records = payload.get("records") or []
+            incomplete_holder = (
+                cached.state == RegistryState.FOUND
+                and isinstance(cached_records, list)
+                and any(
+                    isinstance(item, dict) and bool(str(item.get("ru_number") or "").strip())
+                    for item in cached_records
+                )
+                and not any(
+                    isinstance(item, dict) and bool(str(item.get("holder") or "").strip())
+                    for item in cached_records
+                )
             )
+            if incomplete_holder:
+                logger.info(
+                    "Реестр: кэш по «%s» содержит РУ без держателя — обновляю ELK",
+                    name,
+                    extra=extra,
+                )
+            else:
+                return RegistryResult(
+                    state=cached.state,
+                    records=[
+                        RegistryRecord(
+                            registry=r.get("registry", "?"),
+                            ru_number=r.get("ru_number"),
+                            holder=r.get("holder"),
+                            product_name=r.get("product_name"),
+                            valid=r.get("valid"),
+                            status_text=r.get("status_text"),
+                            card_url=r.get("card_url"),
+                            raw={},
+                        )
+                        for r in cached_records
+                        if isinstance(r, dict)
+                    ],
+                    checked_at=cached.checked_at,
+                    errors=payload.get("errors", {}),
+                    from_cache=True,
+                )
 
         logger.info("Реестр: проверяю «%s» (РУ %s)", name, ru_number or "—", extra=extra)
         (elk_records, elk_error), (mi_records, mi_error) = await asyncio.gather(

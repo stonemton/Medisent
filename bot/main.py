@@ -12,7 +12,7 @@ from aiogram.enums import ParseMode
 from bot import texts
 from bot.config import get_settings
 from bot.db.session import dispose_engine
-from bot.handlers import admin, errors, intake, selection
+from bot.handlers import admin, diagnostics, errors, intake, selection
 from bot.logging_setup import setup_logging
 from bot.middleware import OwnerOnlyMiddleware, ThrottleMiddleware
 from bot.scheduler import start_background_tasks, stop_background_tasks
@@ -38,10 +38,11 @@ def build_dispatcher() -> Dispatcher:
         observer.middleware(owner_only)
         observer.middleware(throttle)
 
-    # Порядок важен. admin ловит команды; selection перехватывает голосовое,
-    # когда заявка ждёт выбора, и пропускает дальше, когда это новая заявка;
+    # Порядок важен. diagnostics/admin ловят команды; selection перехватывает
+    # голосовое, когда заявка ждёт выбора, и пропускает дальше, когда это новая заявка;
     # intake — всё остальное.
     dispatcher.include_router(errors.router)
+    dispatcher.include_router(diagnostics.router)
     dispatcher.include_router(admin.router)
     dispatcher.include_router(selection.router)
     dispatcher.include_router(intake.router)

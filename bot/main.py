@@ -12,7 +12,7 @@ from aiogram.enums import ParseMode
 from bot import texts
 from bot.config import get_settings
 from bot.db.session import dispose_engine
-from bot.handlers import admin, diagnostics, errors, intake, selection
+from bot.handlers import admin, batch_actions, diagnostics, errors, intake, selection
 from bot.logging_setup import setup_logging
 from bot.middleware import OwnerOnlyMiddleware, ThrottleMiddleware
 from bot.scheduler import start_background_tasks, stop_background_tasks
@@ -45,6 +45,9 @@ def build_dispatcher() -> Dispatcher:
     dispatcher.include_router(diagnostics.router)
     dispatcher.include_router(admin.router)
     dispatcher.include_router(selection.router)
+    # Intercept batch:* before the legacy intake callback so agent decisions
+    # can continue into concrete RFQ draft preparation.
+    dispatcher.include_router(batch_actions.router)
     dispatcher.include_router(intake.router)
     return dispatcher
 

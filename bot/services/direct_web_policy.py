@@ -31,6 +31,7 @@ from bot.services.http import ApiClient
 
 logger = logging.getLogger(__name__)
 _ORIGINAL_SCRAPE: Any = None
+_ORIGINAL_ACLOSE: Any = None
 
 
 class _VisibleTextParser(HTMLParser):
@@ -93,7 +94,6 @@ def _html_to_text(body: str) -> str:
         parser.feed(body)
         return parser.text()
     except Exception:
-        # Even malformed supplier HTML can still provide useful plain text.
         return re.sub(r"<[^>]+>", " ", body)
 
 
@@ -171,11 +171,13 @@ async def _direct_fetch(
 
 
 def install_direct_web_policy() -> None:
-    global _ORIGINAL_SCRAPE
+    global _ORIGINAL_SCRAPE, _ORIGINAL_ACLOSE
     if _ORIGINAL_SCRAPE is not None:
         return
     _ORIGINAL_SCRAPE = FirecrawlService.scrape
+    _ORIGINAL_ACLOSE = FirecrawlService.aclose
     original = _ORIGINAL_SCRAPE
+    original_aclose = _ORIGINAL_ACLOSE
 
     async def wrapped(
         self: FirecrawlService,
@@ -190,7 +192,14 @@ def install_direct_web_policy() -> None:
         fallback = await original(self, url, product, request_id=request_id)
         if fallback.ok:
             return fallback
-        # A directly readable page is still more useful than a failed paid fallback.
         return direct if direct is not None else fallback
 
+    async def wrapped_aclose(self: FirecrawlService) -> None:
+        direct_client = getattr(self, "_direct_web_client", None)
+        if direct_client is not None:
+            await direct_client.aclose()
+            setattr(self, "_direct_web_client", None)
+        await original_aclose(self)
+
     FirecrawlService.scrape = wrapped  # type: ignore[method-assign]
+    FirecrawlService.aclose = wrapped_aclose  # type: ignore[method-assign]

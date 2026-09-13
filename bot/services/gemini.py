@@ -1,10 +1,7 @@
-"""Gemini: мультимодальный вход и строгий JSON на выходе.
+"""LLM-сервис для мультимодального ввода и строгого JSON.
 
-Изображения и аудио модель берёт нативно, отдельный Whisper не нужен.
-
-В бесплатном режиме простые текстовые заявки, ранжирование кандидатов и
-черновики писем обрабатываются локально и не расходуют суточную квоту Gemini.
-Gemini остаётся для фото, голоса, файлов и других действительно сложных задач.
+Если задан RELAYMODELS_API_KEY, используется RelayModels через OpenAI-compatible
+/chat/completions. Иначе сохраняется прямой Google Gemini API через GEMINI_API_KEY.
 """
 
 from __future__ import annotations
@@ -25,7 +22,7 @@ from bot.services.llm_json import parse_llm_json
 
 logger = logging.getLogger(__name__)
 
-API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+GOOGLE_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 
 class GeminiError(RuntimeError):
@@ -40,7 +37,7 @@ class Part:
     mime_type: str | None = None
     data: bytes | None = None
 
-    def to_api(self) -> dict[str, Any]:
+    def to_google(self) -> dict[str, Any]:
         if self.text is not None:
             return {"text": self.text}
         if self.data is None or self.mime_type is None:
@@ -52,11 +49,24 @@ class Part:
             }
         }
 
+    def to_openai(self) -> dict[str, Any]:
+        if self.text is not None:
+            return {"type": "text", "text": self.text}
+        if self.data is None or self.mime_type is None:
+            raise ValueError("часть без текста должна иметь mime_type и данные")
+        encoded = base64.b64encode(self.data).decode("ascii")
+        if self.mime_type.startswith("image/") or self.mime_type == "application/pdf":
+            return {
+                "type": "image_url",
+                "image_url": {"url": f"data:{self.mime_type};base64,{encoded}"},
+            }
+        raise GeminiError(
+            f"RelayModels: тип {self.mime_type} нельзя передать через chat/completions"
+        )
+
 
 @dataclass(slots=True)
 class ProductRequest:
-    """Результат разбора входа. Одна форма для текста, фото, голоса и файла."""
-
     product: str
     qty: str = "не указано"
     requirements: list[str] = field(default_factory=list)
@@ -94,7 +104,6 @@ _QTY_RE = re.compile(
 
 
 def _parse_text_locally(text: str) -> ProductRequest:
-    """Разобрать обычную текстовую заявку без LLM и без расхода Gemini."""
     raw = " ".join((text or "").strip().split())
     if not raw:
         return ProductRequest(product="", raw_input=text)
@@ -115,13 +124,6 @@ def _parse_text_locally(text: str) -> ProductRequest:
 
 
 def _local_rank(payload: dict[str, Any]) -> dict[str, Any]:
-    """Детерминированное ранжирование без LLM.
-
-    Самый сильный сигнал — доказанная связь конкретного товара поставщика с
-    найденным действующим РУ. Совпадение отличительного бренда/модели получает
-    отдельный бонус: производитель или официальный источник не должен
-    проигрывать случайному магазину только из-за опубликованной цены.
-    """
     ranked: list[tuple[int, int, dict[str, Any], list[str]]] = []
     for index, candidate in enumerate(payload.get("candidates") or []):
         if not isinstance(candidate, dict):
@@ -146,10 +148,6 @@ def _local_rank(payload: dict[str, Any]) -> dict[str, Any]:
             ru_valid = registry.get("ru_valid")
             site_match = registry.get("site_match")
             match_basis = str(registry.get("match_basis") or "")
-
-            # Само РУ относится к изделию и одинаково для всех поставщиков,
-            # поэтому его вес умеренный. Главный дифференциатор ниже — связь
-            # конкретной страницы поставщика с этим РУ.
             if state == "found" and ru_valid is True:
                 score += 20
                 reasons.append("найдено действующее РУ на изделие")
@@ -196,10 +194,10 @@ def _local_rank(payload: dict[str, Any]) -> dict[str, Any]:
         ranked.append((score, index, {"id": candidate.get("id"), "reason": reason}, concerns))
 
     ranked.sort(key=lambda item: (-item[0], item[1]))
-    rows = []
-    for rank, (_, _, base, concerns) in enumerate(ranked, start=1):
-        rows.append({"id": base["id"], "rank": rank, "reason": base["reason"], "concerns": concerns})
-
+    rows = [
+        {"id": base["id"], "rank": rank, "reason": base["reason"], "concerns": concerns}
+        for rank, (_, _, base, concerns) in enumerate(ranked, start=1)
+    ]
     missing: list[str] = []
     if any(
         (c.get("registry") or {}).get("state") == "unavailable"
@@ -210,7 +208,7 @@ def _local_rank(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "ranked": rows,
         "summary": (
-            "Рейтинг рассчитан локально без Gemini: приоритет у подтверждённой связи "
+            "Рейтинг рассчитан локально без LLM: приоритет у подтверждённой связи "
             "товара поставщика с РУ и совпадения бренда/модели; затем учитываются "
             "наличие, контакты и цена."
         ),
@@ -227,11 +225,7 @@ def _local_email(payload: dict[str, Any]) -> dict[str, Any]:
     token = str(payload.get("token") or "").strip()
 
     greeting = f"Добрый день, коллеги из {supplier_name}!" if supplier_name else "Добрый день!"
-    lines = [
-        greeting,
-        "",
-        f"Просим предоставить коммерческое предложение на: {product}.",
-    ]
+    lines = [greeting, "", f"Просим предоставить коммерческое предложение на: {product}."]
     if qty and qty != "не указано":
         lines.append(f"Количество: {qty}.")
     if isinstance(requirements, list) and requirements:
@@ -253,16 +247,74 @@ def _local_email(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _openai_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Преобразовать старую Gemini-схему с TYPE в обычный JSON Schema."""
+    type_map = {
+        "OBJECT": "object",
+        "ARRAY": "array",
+        "STRING": "string",
+        "NUMBER": "number",
+        "INTEGER": "integer",
+        "BOOLEAN": "boolean",
+    }
+
+    def convert(value: Any) -> Any:
+        if isinstance(value, dict):
+            out: dict[str, Any] = {}
+            for key, item in value.items():
+                if key == "type" and isinstance(item, str):
+                    out[key] = type_map.get(item.upper(), item.lower())
+                else:
+                    out[key] = convert(item)
+            if out.get("type") == "object":
+                out.setdefault("additionalProperties", False)
+            return out
+        if isinstance(value, list):
+            return [convert(item) for item in value]
+        return value
+
+    result = convert(schema)
+    if not isinstance(result, dict):
+        raise GeminiError("некорректная JSON schema")
+    return result
+
+
+def _assistant_text(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return ""
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                chunks.append(item["text"])
+        return "".join(chunks).strip()
+    return ""
+
+
 class GeminiService:
     def __init__(self) -> None:
         settings = get_settings()
         self._settings = settings
-        self._client = ApiClient(
-            "gemini",
-            base_url=API_BASE,
-            headers={"Content-Type": "application/json"},
-            timeout_read=120.0,
-        )
+        self._relay = settings.relaymodels_enabled
+        if self._relay:
+            self._client = ApiClient(
+                "relaymodels",
+                base_url=settings.relaymodels_base_url.rstrip("/"),
+                headers={"Authorization": f"Bearer {settings.relaymodels_api_key}"},
+                timeout_read=120.0,
+            )
+        else:
+            self._client = ApiClient(
+                "gemini",
+                base_url=GOOGLE_API_BASE,
+                headers={"Content-Type": "application/json"},
+                timeout_read=120.0,
+            )
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -280,47 +332,80 @@ class GeminiService:
     ) -> dict[str, Any]:
         settings = self._settings
         if not settings.gemini_enabled:
-            raise GeminiError("GEMINI_API_KEY не задан")
+            raise GeminiError("RELAYMODELS_API_KEY/GEMINI_API_KEY не задан")
 
         model_name = model or settings.llm_report_model
-        body: dict[str, Any] = {
-            "contents": [{"role": "user", "parts": [p.to_api() for p in parts]}],
-            "systemInstruction": {"parts": [{"text": system_instruction}]},
-            "generationConfig": {
+        if self._relay:
+            content = [part.to_openai() for part in parts]
+            body: dict[str, Any] = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": content},
+                ],
                 "temperature": temperature,
-                "responseMimeType": "application/json",
-            },
-        }
-        if schema is not None:
-            body["generationConfig"]["responseSchema"] = schema
+            }
+            if schema is not None:
+                body["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "medisent_response",
+                        "schema": _openai_schema(schema),
+                    },
+                }
+            else:
+                body["response_format"] = {"type": "json_object"}
 
-        result = await self._client.post(
-            f"/models/{model_name}:generateContent",
-            operation=f"{operation}:{model_name}",
-            request_id=request_id,
-            params={"key": settings.gemini_api_key},
-            json=body,
-            price=lambda payload: usage_from_payload(payload, model_name),
-        )
-        if not result.ok:
-            if result.budget_exceeded:
-                raise GeminiError("исчерпан потолок расходов на заявку")
-            raise GeminiError(result.error or "вызов Gemini не удался")
+            result = await self._client.post(
+                "/chat/completions",
+                operation=f"{operation}:{model_name}",
+                request_id=request_id,
+                json=body,
+                price=lambda payload: usage_from_payload(payload, model_name),
+            )
+            if not result.ok:
+                if result.budget_exceeded:
+                    raise GeminiError("исчерпан потолок расходов на заявку")
+                raise GeminiError(result.error or "вызов RelayModels не удался")
+            payload = result.json or {}
+            raw_text = _assistant_text(payload)
+        else:
+            body = {
+                "contents": [{"role": "user", "parts": [p.to_google() for p in parts]}],
+                "systemInstruction": {"parts": [{"text": system_instruction}]},
+                "generationConfig": {
+                    "temperature": temperature,
+                    "responseMimeType": "application/json",
+                },
+            }
+            if schema is not None:
+                body["generationConfig"]["responseSchema"] = schema
+            result = await self._client.post(
+                f"/models/{model_name}:generateContent",
+                operation=f"{operation}:{model_name}",
+                request_id=request_id,
+                params={"key": settings.gemini_api_key},
+                json=body,
+                price=lambda payload: usage_from_payload(payload, model_name),
+            )
+            if not result.ok:
+                if result.budget_exceeded:
+                    raise GeminiError("исчерпан потолок расходов на заявку")
+                raise GeminiError(result.error or "вызов Gemini не удался")
+            payload = result.json or {}
+            candidates = payload.get("candidates") or []
+            if not candidates:
+                reason = payload.get("promptFeedback", {}).get("blockReason")
+                raise GeminiError(f"модель не вернула ответ (blockReason={reason})")
+            text_parts = candidates[0].get("content", {}).get("parts", [])
+            raw_text = "".join(part.get("text", "") for part in text_parts).strip()
 
-        payload = result.json or {}
-        candidates = payload.get("candidates") or []
-        if not candidates:
-            reason = payload.get("promptFeedback", {}).get("blockReason")
-            raise GeminiError(f"модель не вернула ответ (blockReason={reason})")
-
-        text_parts = candidates[0].get("content", {}).get("parts", [])
-        raw_text = "".join(part.get("text", "") for part in text_parts).strip()
         if not raw_text:
             raise GeminiError("модель вернула пустой текст")
 
         parsed = parse_llm_json(raw_text)
         if parsed is None:
-            logger.error("Gemini вернул не JSON: %s", raw_text[:300], extra=log_extra(request_id))
+            logger.error("LLM вернул не JSON: %s", raw_text[:300], extra=log_extra(request_id))
             raise GeminiError("ответ не разобрался как JSON")
         if not isinstance(parsed, dict):
             raise GeminiError("ожидался объект JSON")
@@ -334,7 +419,6 @@ class GeminiService:
             raise GeminiError(f"нет файла инструкции {path}") from exc
 
     async def parse_text(self, text: str, *, request_id: int | None = None) -> ProductRequest:
-        # Обычный текст не тратит Gemini. Это основной бесплатный путь.
         return _parse_text_locally(text)
 
     async def parse_photo(
@@ -352,9 +436,34 @@ class GeminiService:
         )
         return _to_product_request(parsed, raw_input="[фото]")
 
+    async def _relay_transcribe(
+        self,
+        audio: bytes,
+        mime_type: str,
+        *,
+        request_id: int | None = None,
+    ) -> str:
+        result = await self._client.post(
+            "/audio/transcriptions",
+            operation=f"transcribe:{self._settings.relaymodels_transcribe_model}",
+            request_id=request_id,
+            files={"file": ("voice.ogg", audio, mime_type)},
+            data={"model": self._settings.relaymodels_transcribe_model},
+        )
+        if not result.ok:
+            raise GeminiError(result.error or "RelayModels не распознал аудио")
+        payload = result.json or {}
+        return str(payload.get("text") or payload.get("transcript") or "").strip()
+
     async def parse_voice(
         self, audio: bytes, mime_type: str = "audio/ogg", *, request_id: int | None = None
     ) -> ProductRequest:
+        if self._relay:
+            transcript = await self._relay_transcribe(audio, mime_type, request_id=request_id)
+            result = _parse_text_locally(transcript)
+            result.transcript = transcript
+            result.raw_input = transcript
+            return result
         parsed = await self.generate_json(
             parts=[
                 Part(text="Это голосовое сообщение закупщика. Расшифруй и определи изделие."),
@@ -390,6 +499,8 @@ class GeminiService:
     async def transcribe(
         self, audio: bytes, mime_type: str = "audio/ogg", *, request_id: int | None = None
     ) -> str:
+        if self._relay:
+            return await self._relay_transcribe(audio, mime_type, request_id=request_id)
         parsed = await self.generate_json(
             parts=[
                 Part(text="Расшифруй это голосовое сообщение дословно, по-русски."),
@@ -417,8 +528,6 @@ class GeminiService:
         operation: str | None = None,
         untrusted: bool = True,
     ) -> dict[str, Any]:
-        # Два частых шага выполняются локально: это сохраняет бесплатную
-        # суточную квоту для фото, голоса и документов.
         if prompt_name == "report":
             return _local_rank(payload)
         if prompt_name == "email":
@@ -442,7 +551,20 @@ class GeminiService:
 
 
 def usage_from_payload(payload: Any, model_name: str) -> Usage:
-    meta = (payload or {}).get("usageMetadata", {}) if isinstance(payload, dict) else {}
+    if not isinstance(payload, dict):
+        return Usage()
+    usage = payload.get("usage") or {}
+    if isinstance(usage, dict) and usage:
+        tokens_in = int(usage.get("prompt_tokens", 0) or 0)
+        tokens_out = int(usage.get("completion_tokens", 0) or 0)
+        cached = usage.get("cached_tokens")
+        return Usage(
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cached_tokens=int(cached) if cached is not None else None,
+            cost_usd=pricing.llm_cost(model_name, tokens_in, tokens_out),
+        )
+    meta = payload.get("usageMetadata", {})
     tokens_in = int(meta.get("promptTokenCount", 0) or 0)
     tokens_out = int(meta.get("candidatesTokenCount", 0) or 0)
     cached = meta.get("cachedContentTokenCount")

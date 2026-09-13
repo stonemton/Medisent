@@ -23,6 +23,7 @@ from bot.services.http import flush_meter
 from bot.services.mail import close_mail_service
 from bot.services.perplexity import close_perplexity_service
 from bot.services.registry import close_registry_service
+from bot.services.registry_query_fallbacks import install_registry_query_fallbacks
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ def build_dispatcher() -> Dispatcher:
 async def main() -> None:
     settings = get_settings()
     setup_logging(settings.log_level, settings.log_dir)
+    install_registry_query_fallbacks()
 
     warnings = settings.warn_about_missing_keys()
     logger.info("Запуск бота. Предупреждений: %s", len(warnings))

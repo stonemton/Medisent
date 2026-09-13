@@ -1,5 +1,5 @@
 # Бот
-aiogram==3.15.0
+aiogram==3.16.0
 
 # База
 SQLAlchemy[asyncio]==2.0.36

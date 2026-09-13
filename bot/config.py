@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     relaymodels_transcribe_model: str = "gpt-4o-transcribe"
     llm_report_model: str = "gemini-3.8-flash"
     llm_email_model: str = "gemini-3.8-flash"
-    # Одиночный агент/арбитр. Railway может переопределять это значение.
+    # Legacy variable is kept for compatibility, but central decisions are forced to GPT below.
     llm_agent_model: str = "gemini-3.8-flash"
     # Пакетный агент видит всю закупку одним запросом. По умолчанию — GPT через RelayModels.
     llm_batch_agent_model: str = "gpt-5.6-sol"
@@ -100,9 +100,11 @@ class Settings(BaseSettings):
         return value
 
     @model_validator(mode="after")
-    def _mail_aliases(self) -> "Settings":
+    def _runtime_aliases(self) -> "Settings":
         if self.yandex_email and not self.gmail_sender:
             self.gmail_sender = self.yandex_email
+        # Switch the whole central decision layer from Claude/legacy env overrides to GPT.
+        self.llm_agent_model = self.llm_batch_agent_model
         return self
 
     @property

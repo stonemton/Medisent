@@ -46,7 +46,11 @@ NON_SUPPLIER_DOMAINS = frozenset({
     "made-in-china.com", "ru.made-in-china.com", "moy-zakupki.ru",
     "rusprofile.ru", "list-org.com", "zachestnyibiznes.ru", "sbis.ru",
     "roszdravnadzor.gov.ru", "zakupki.gov.ru", "consultant.ru", "garant.ru",
-    "nevacert.ru",
+    "nevacert.ru", "analitikamed.ru", "torgi.egov66.ru", "torgi.gov.ru",
+})
+
+NON_SUPPLIER_HOST_LABELS = frozenset({
+    "torgi", "zakupki", "goszakupki", "reestr", "registry",
 })
 
 SUPPLIERS_SCHEMA_HINT = """Формат ответа (только JSON):
@@ -100,7 +104,15 @@ def is_supplier_domain(url: str) -> bool:
     domain = domain_of(url)
     if not domain or "." not in domain:
         return False
-    return not any(domain == bad or domain.endswith("." + bad) for bad in NON_SUPPLIER_DOMAINS)
+    if any(domain == bad or domain.endswith("." + bad) for bad in NON_SUPPLIER_DOMAINS):
+        return False
+    labels = domain.split(".")
+    # Госзакупки/торги/реестры часто приходят из citations как будто это компания.
+    # Блокируем их до Firecrawl и до Supplier Gate, чтобы они вообще не попадали
+    # в коммерческий пул кандидатов.
+    if any(label in NON_SUPPLIER_HOST_LABELS for label in labels[:-2]):
+        return False
+    return True
 
 
 def _agent_text(payload: dict[str, Any]) -> str:

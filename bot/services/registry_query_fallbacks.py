@@ -24,6 +24,10 @@ _SPACE_RE = re.compile(r"\s+")
 
 _GEMATOLOG_ABO_RU = "ФСР 2008/04007"
 _GEMATOLOG_ANTI_D_SUPER_RU = "ФСР 2009/05552"
+_GEMATOLOG_ANTI_D_FAMILY_QUERY = (
+    "АНТИ-Rho(D) IgM моноклональный реагент для определения резус-принадлежности "
+    "крови человека ЭРИТРОТЕСТ Цоликлон Анти-D Супер 9398-002-27575295-2004"
+)
 _MEDIKLON_ABO_RH_KELL_RU = "ФСР 2009/06043"
 _MEDIKLON_FAMILY_QUERY = (
     "Набор реагентов для определения групп крови человека систем АВО, Резус и Kell "
@@ -106,8 +110,8 @@ def install_registry_query_fallbacks() -> None:
     original_check = _ORIGINAL_CHECK
     exact_cache: dict[str, tuple[list[RegistryRecord], str | None]] = {}
     exact_inflight: dict[str, asyncio.Task[tuple[list[RegistryRecord], str | None]]] = {}
-    family_cache: tuple[list[RegistryRecord], str | None] | None = None
-    family_inflight: asyncio.Task[tuple[list[RegistryRecord], str | None]] | None = None
+    named_cache: dict[str, tuple[list[RegistryRecord], str | None]] = {}
+    named_inflight: dict[str, asyncio.Task[tuple[list[RegistryRecord], str | None]]] = {}
 
     async def exact_ru(self: RegistryService, ru: str, request_id: int | None) -> tuple[list[RegistryRecord], str | None]:
         cached = exact_cache.get(ru)
@@ -126,20 +130,21 @@ def install_registry_query_fallbacks() -> None:
             exact_cache[ru] = result
         return result
 
-    async def mediclone_family(self: RegistryService, request_id: int | None) -> tuple[list[RegistryRecord], str | None]:
-        nonlocal family_cache, family_inflight
-        if family_cache is not None:
-            return family_cache
-        if family_inflight is None:
-            family_inflight = asyncio.create_task(original_check(self, _MEDIKLON_FAMILY_QUERY, None, request_id))
-        task = family_inflight
+    async def named_family(self: RegistryService, query: str, request_id: int | None) -> tuple[list[RegistryRecord], str | None]:
+        cached = named_cache.get(query)
+        if cached is not None:
+            return cached
+        task = named_inflight.get(query)
+        if task is None:
+            task = asyncio.create_task(original_check(self, query, None, request_id))
+            named_inflight[query] = task
         try:
             result = await task
         finally:
-            if family_inflight is task and task.done():
-                family_inflight = None
+            if named_inflight.get(query) is task and task.done():
+                named_inflight.pop(query, None)
         if result[0]:
-            family_cache = result
+            named_cache[query] = result
         return result
 
     async def _check_elk_with_fallbacks(self: RegistryService, name: str | None, ru_number: str | None, request_id: int | None) -> tuple[list[RegistryRecord], str | None]:
@@ -153,10 +158,26 @@ def install_registry_query_fallbacks() -> None:
         (primary_records, primary_error), (alt_records, alt_error) = await asyncio.gather(
             exact_ru(self, primary_ru, request_id), exact_ru(self, _MEDIKLON_ABO_RH_KELL_RU, request_id)
         )
-        primary = [r for r in primary_records if _holder_matches(r, "гематолог") and _antigen_matches(kind, r)]
+        primary = [r for r in primary_records if _ru_matches(r, primary_ru) and _holder_matches(r, "гематолог") and _antigen_matches(kind, r)]
+
+        # ELK иногда не находит ФСР 2009/05552 по самому номеру, хотя карточка
+        # находится по официальному наименованию и ТУ. Для Anti-D делаем один
+        # дедуплицированный поиск по официальной товарной строке и всё равно
+        # требуем точный RU + держателя + антиген перед принятием.
+        if kind == "d" and not primary:
+            d_records, d_error = await named_family(self, _GEMATOLOG_ANTI_D_FAMILY_QUERY, request_id)
+            primary = [
+                r for r in d_records
+                if _ru_matches(r, _GEMATOLOG_ANTI_D_SUPER_RU)
+                and _holder_matches(r, "гематолог")
+                and _antigen_matches("d", r)
+            ]
+            if d_error and not primary_error:
+                primary_error = d_error
+
         alternatives = [r for r in alt_records if _ru_matches(r, _MEDIKLON_ABO_RH_KELL_RU) and _holder_matches(r, "медиклон") and _antigen_matches(kind, r)]
         if not alternatives:
-            family_records, family_error = await mediclone_family(self, request_id)
+            family_records, family_error = await named_family(self, _MEDIKLON_FAMILY_QUERY, request_id)
             alternatives = [r for r in family_records if _ru_matches(r, _MEDIKLON_ABO_RH_KELL_RU) and _holder_matches(r, "медиклон") and _antigen_matches(kind, r)]
             if family_error and not alt_error:
                 alt_error = family_error

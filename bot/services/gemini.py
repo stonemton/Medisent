@@ -117,8 +117,10 @@ def _parse_text_locally(text: str) -> ProductRequest:
 def _local_rank(payload: dict[str, Any]) -> dict[str, Any]:
     """Детерминированное ранжирование без LLM.
 
-    Оцениваются только факты, уже собранные конвейером: наличие на сайте,
-    состояние РУ, контакты и опубликованная цена. Никаких выдуманных признаков.
+    Самый сильный сигнал — доказанная связь конкретного товара поставщика с
+    найденным действующим РУ. Совпадение отличительного бренда/модели получает
+    отдельный бонус: производитель или официальный источник не должен
+    проигрывать случайному магазину только из-за опубликованной цены.
     """
     ranked: list[tuple[int, int, dict[str, Any], list[str]]] = []
     for index, candidate in enumerate(payload.get("candidates") or []):
@@ -130,7 +132,7 @@ def _local_rank(payload: dict[str, Any]) -> dict[str, Any]:
 
         site_claims = candidate.get("site_claims")
         if site_claims is True:
-            score += 50
+            score += 30
             reasons.append("на сайте найдено подтверждение товара")
         elif site_claims is False:
             score -= 20
@@ -142,26 +144,47 @@ def _local_rank(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(registry, dict):
             state = str(registry.get("state") or "")
             ru_valid = registry.get("ru_valid")
+            site_match = registry.get("site_match")
+            match_basis = str(registry.get("match_basis") or "")
+
+            # Само РУ относится к изделию и одинаково для всех поставщиков,
+            # поэтому его вес умеренный. Главный дифференциатор ниже — связь
+            # конкретной страницы поставщика с этим РУ.
             if state == "found" and ru_valid is True:
-                score += 30
+                score += 20
                 reasons.append("найдено действующее РУ на изделие")
             elif state == "found":
-                score += 10
+                score += 5
                 reasons.append("РУ найдено, статус требует внимания")
             elif state == "unavailable":
                 concerns.append("реестр РУ был недоступен")
             elif state == "not_found":
-                score -= 10
+                score -= 15
                 concerns.append("РУ не найдено")
 
+            if site_match is True:
+                score += 60
+                reasons.append("товар поставщика подтверждённо связан с найденным РУ")
+                if "бренд/модель" in match_basis.lower():
+                    score += 40
+                    reasons.append("совпадает отличительный бренд/модель")
+                elif "номер ру" in match_basis.lower() or "ру " in match_basis.lower():
+                    score += 20
+                    reasons.append("на странице поставщика указан тот же номер РУ")
+            elif site_match is False:
+                score -= 60
+                concerns.append("на странице поставщика есть противоречие с найденным РУ")
+            elif state == "found":
+                concerns.append("связь товара поставщика с найденным РУ не подтверждена")
+
         if candidate.get("email"):
-            score += 15
+            score += 10
             reasons.append("есть e-mail")
         if candidate.get("phone"):
             score += 5
             reasons.append("есть телефон")
         if candidate.get("site_price") is not None:
-            score += 10
+            score += 5
             reasons.append("есть опубликованная цена")
 
         flags = candidate.get("unrega_flags") or []
@@ -178,11 +201,19 @@ def _local_rank(payload: dict[str, Any]) -> dict[str, Any]:
         rows.append({"id": base["id"], "rank": rank, "reason": base["reason"], "concerns": concerns})
 
     missing: list[str] = []
-    if any((c.get("registry") or {}).get("state") == "unavailable" for c in payload.get("candidates") or [] if isinstance(c, dict)):
+    if any(
+        (c.get("registry") or {}).get("state") == "unavailable"
+        for c in payload.get("candidates") or []
+        if isinstance(c, dict)
+    ):
         missing.append("проверка РУ недоступна")
     return {
         "ranked": rows,
-        "summary": "Рейтинг рассчитан локально без Gemini по подтверждённым данным сайта, РУ, контактам и цене.",
+        "summary": (
+            "Рейтинг рассчитан локально без Gemini: приоритет у подтверждённой связи "
+            "товара поставщика с РУ и совпадения бренда/модели; затем учитываются "
+            "наличие, контакты и цена."
+        ),
         "missing_data": missing,
     }
 

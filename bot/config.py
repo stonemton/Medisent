@@ -10,7 +10,7 @@ import logging
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -44,12 +44,19 @@ class Settings(BaseSettings):
     perplexity_api_key: str = ""
     firecrawl_api_key: str = ""
 
-    # --- Gmail ----------------------------------------------------------
-    google_client_id: str = ""
-    google_client_secret: str = ""
-    google_refresh_token: str = ""
-    gmail_sender: str = ""
+    # --- Почта ----------------------------------------------------------
+    # Основной вариант для Railway: Яндекс Почта по IMAP/SMTP.
+    yandex_email: str = ""
+    yandex_app_password: str = ""
+    imap_host: str = "imap.yandex.ru"
+    imap_port: int = 993
+    smtp_host: str = "smtp.yandex.ru"
+    smtp_port: int = 465
     forward_to_email: str = ""
+
+    # Оставлено как совместимый псевдоним для существующего кода планировщика.
+    # После валидации сюда подставляется YANDEX_EMAIL.
+    gmail_sender: str = ""
 
     # --- Реестры --------------------------------------------------------
     registry_elk_base: str = "https://elk.roszdravnadzor.gov.ru"
@@ -92,8 +99,16 @@ class Settings(BaseSettings):
     @classmethod
     def _sane_poll_interval(cls, value: int) -> int:
         if value < 60:
-            raise ValueError("GMAIL_POLL_SECONDS ниже 60 с упрётся в квоты Gmail API")
+            raise ValueError("GMAIL_POLL_SECONDS должен быть не меньше 60 секунд")
         return value
+
+    @model_validator(mode="after")
+    def _mail_aliases(self) -> "Settings":
+        # Старые модули используют gmail_sender; не заставляем менять их все
+        # одновременно при переходе на Яндекс.
+        if self.yandex_email and not self.gmail_sender:
+            self.gmail_sender = self.yandex_email
+        return self
 
     # --- Производные признаки -------------------------------------------
 
@@ -115,13 +130,18 @@ class Settings(BaseSettings):
         return bool(self.gemini_api_key)
 
     @property
-    def gmail_enabled(self) -> bool:
+    def yandex_mail_enabled(self) -> bool:
         return bool(
-            self.google_client_id
-            and self.google_client_secret
-            and self.google_refresh_token
-            and self.gmail_sender
+            self.yandex_email
+            and self.yandex_app_password
+            and self.imap_host
+            and self.smtp_host
         )
+
+    @property
+    def gmail_enabled(self) -> bool:
+        """Совместимый флаг: старый scheduler запускает почту по этому имени."""
+        return self.yandex_mail_enabled
 
     def warn_about_missing_keys(self) -> list[str]:
         """Возвращает список предупреждений и пишет их в лог. Запуск не прерывает."""
@@ -134,8 +154,8 @@ class Settings(BaseSettings):
             warnings.append("PERPLEXITY_API_KEY не задан — поиск поставщиков выключен")
         if not self.scrape_enabled:
             warnings.append("FIRECRAWL_API_KEY не задан — скрейп сайтов поставщиков выключен")
-        if not self.gmail_enabled:
-            warnings.append("Gmail не настроен — отправка писем и приём ответов выключены")
+        if not self.yandex_mail_enabled:
+            warnings.append("Яндекс Почта не настроена — отправка писем и приём ответов выключены")
         for text in warnings:
             logger.warning("%s", text)
         return warnings

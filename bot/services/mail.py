@@ -1,7 +1,8 @@
-"""Яндекс Почта: входящие по IMAP, исходящие по SMTP STARTTLS (587).
+"""Яндекс Почта через IMAP.
 
-Railway может блокировать SMTPS 465. Этот вариант использует submission-порт
-587 и STARTTLS. Если Railway блокирует и 587, отправку вынесем в отдельный шлюз.
+MEDISENT читает входящие и сохраняет подготовленные письма в стандартную
+папку Drafts. SMTP намеренно не используется: пользователь проверяет черновик
+в Яндекс.Почте и отправляет его вручную.
 """
 
 from __future__ import annotations
@@ -11,7 +12,6 @@ import base64
 import imaplib
 import logging
 import re
-import smtplib
 import ssl
 from dataclasses import dataclass, field
 from email import policy
@@ -192,7 +192,7 @@ class MailService:
         if not self._settings.yandex_mail_enabled:
             raise MailError("Яндекс Почта не настроена")
 
-    def _imap_connect(self) -> imaplib.IMAP4_SSL:
+    def _imap_login(self) -> imaplib.IMAP4_SSL:
         self._require_enabled()
         try:
             client = imaplib.IMAP4_SSL(
@@ -202,30 +202,66 @@ class MailService:
                 timeout=30,
             )
             client.login(self._settings.yandex_email, self._settings.yandex_app_password)
-            status, _ = client.select("INBOX", readonly=True)
-            if status != "OK":
-                client.logout()
-                raise MailError("не удалось открыть INBOX Яндекс Почты")
             return client
         except MailError:
             raise
         except Exception as exc:
             raise MailError(f"не удалось подключиться к Яндекс IMAP: {exc}") from exc
 
-    def _smtp_send_bytes(self, raw: bytes, recipients: list[str]) -> None:
-        self._require_enabled()
+    def _imap_connect(self) -> imaplib.IMAP4_SSL:
+        client = self._imap_login()
         try:
-            with smtplib.SMTP(self._settings.smtp_host, self._settings.smtp_port, timeout=30) as smtp:
-                smtp.ehlo()
-                smtp.starttls(context=ssl.create_default_context())
-                smtp.ehlo()
-                smtp.login(self._settings.yandex_email, self._settings.yandex_app_password)
-                smtp.sendmail(self._settings.yandex_email, recipients, raw)
+            status, _ = client.select("INBOX", readonly=True)
+            if status != "OK":
+                client.logout()
+                raise MailError("не удалось открыть INBOX Яндекс Почты")
+            return client
+        except Exception:
+            try:
+                client.logout()
+            except Exception:
+                pass
+            raise
+
+    def _find_drafts_mailbox(self, client: imaplib.IMAP4_SSL) -> str:
+        """Найти серверную папку с атрибутом \\Drafts; для Yandex fallback = Drafts."""
+        try:
+            status, rows = client.list()
+            if status == "OK" and rows:
+                for row in rows:
+                    if not row or b"\\Drafts" not in row:
+                        continue
+                    text = row.decode("utf-8", errors="replace")
+                    # Последний элемент LIST — имя папки, обычно quoted-string.
+                    match = re.search(r'\s"([^\"]+)"$', text)
+                    if match:
+                        return match.group(1)
+                    return text.rsplit(" ", 1)[-1].strip('"')
+        except Exception:
+            logger.debug("Не удалось определить папку Drafts по SPECIAL-USE", exc_info=True)
+        return "Drafts"
+
+    def _append_draft_bytes(self, raw: bytes) -> str:
+        client = self._imap_login()
+        try:
+            mailbox = self._find_drafts_mailbox(client)
+            status, data = client.append(mailbox, "(\\Draft)", None, raw)
+            if status != "OK":
+                details = " ".join(
+                    item.decode("utf-8", errors="replace") if isinstance(item, bytes) else str(item)
+                    for item in (data or [])
+                )
+                raise MailError(f"не удалось сохранить черновик в {mailbox}: {details or status}")
+            return mailbox
+        except MailError:
+            raise
         except Exception as exc:
-            raise MailError(
-                f"письмо не отправлено через Яндекс SMTP STARTTLS "
-                f"{self._settings.smtp_host}:{self._settings.smtp_port}: {exc}"
-            ) from exc
+            raise MailError(f"не удалось сохранить черновик в Яндекс.Почте: {exc}") from exc
+        finally:
+            try:
+                client.logout()
+            except Exception:
+                pass
 
     def _all_uids_sync(self) -> list[str]:
         client = self._imap_connect()
@@ -271,6 +307,7 @@ class MailService:
         request_id: int | None = None,
         message_id: str | None = None,
     ) -> tuple[str, str]:
+        """Сформировать письмо и сохранить его как черновик в Яндекс.Почте."""
         raw_b64, message_id = build_message(
             sender=self._settings.yandex_email,
             sender_name="Medisent",
@@ -280,9 +317,10 @@ class MailService:
             body=body,
             message_id=message_id,
         )
-        await asyncio.to_thread(self._smtp_send_bytes, _decode_raw_message(raw_b64), [to])
+        mailbox = await asyncio.to_thread(self._append_draft_bytes, _decode_raw_message(raw_b64))
         logger.info(
-            "Письмо отправлено через Яндекс SMTP STARTTLS на %s, msgid=%s",
+            "Черновик сохранён в Яндекс.Почте (%s) для %s, msgid=%s",
+            mailbox,
             to,
             message_id,
             extra=log_extra(request_id),
@@ -298,12 +336,13 @@ class MailService:
         mime_type: str,
         request_id: int | None = None,
     ) -> None:
+        """Сохранить письмо с вложением как черновик вместо автоматической отправки."""
         message = EmailMessage()
         message["Subject"] = f"Файл из Telegram: {filename}"
         message["From"] = self._settings.yandex_email
         message["To"] = to
         message["Message-ID"] = new_message_id(self._settings.yandex_email)
-        message.set_content("Файл переслан ботом подбора поставщиков.")
+        message.set_content("Файл подготовлен ботом MEDISENT.")
         maintype, _, subtype = mime_type.partition("/")
         message.add_attachment(
             content,
@@ -311,8 +350,14 @@ class MailService:
             subtype=subtype or "octet-stream",
             filename=filename,
         )
-        await asyncio.to_thread(self._smtp_send_bytes, message.as_bytes(), [to])
-        logger.info("Файл %s переслан через Яндекс на %s", filename, to, extra=log_extra(request_id))
+        mailbox = await asyncio.to_thread(self._append_draft_bytes, message.as_bytes())
+        logger.info(
+            "Черновик с файлом %s сохранён в %s для %s",
+            filename,
+            mailbox,
+            to,
+            extra=log_extra(request_id),
+        )
 
     async def current_history_id(self, request_id: int | None = None) -> str | None:
         uids = await asyncio.to_thread(self._all_uids_sync)

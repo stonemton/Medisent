@@ -1,8 +1,9 @@
 """Central decision layer for Medisent.
 
 The agent never discovers registry facts itself. It receives already verified
-candidates from tools/services, asks the configured LLM to arbitrate ambiguous
-matches, and validates that the model selected only an existing candidate.
+facts from tools/services, arbitrates ambiguous matches, and plans the next
+procurement step. Every model decision is bounded by an explicit allow-list and
+validated before the application uses it.
 """
 from __future__ import annotations
 
@@ -29,6 +30,33 @@ REGISTRY_DECISION_SCHEMA: dict[str, Any] = {
     "required": ["primary_index", "confidence", "needs_review", "reasoning"],
 }
 
+WORKFLOW_ACTIONS = {
+    "search_suppliers",
+    "ask_clarification",
+    "prepare_rfqs",
+    "split_procurement",
+    "compare_quotes",
+    "finish",
+}
+
+WORKFLOW_DECISION_SCHEMA: dict[str, Any] = {
+    "type": "OBJECT",
+    "properties": {
+        "action": {"type": "STRING"},
+        "confidence": {"type": "NUMBER"},
+        "user_message": {"type": "STRING"},
+        "clarification_question": {"type": "STRING"},
+        "reasoning": {"type": "STRING"},
+    },
+    "required": [
+        "action",
+        "confidence",
+        "user_message",
+        "clarification_question",
+        "reasoning",
+    ],
+}
+
 
 @dataclass(slots=True)
 class RegistryDecision:
@@ -36,6 +64,16 @@ class RegistryDecision:
     confidence: float
     needs_review: bool
     reasoning: str
+    used_llm: bool = True
+
+
+@dataclass(slots=True)
+class WorkflowDecision:
+    action: str
+    confidence: float
+    user_message: str
+    clarification_question: str = ""
+    reasoning: str = ""
     used_llm: bool = True
 
 
@@ -66,11 +104,7 @@ async def choose_registry_primary(
     request_id: int | None = None,
     procurement_context: list[str] | None = None,
 ) -> RegistryDecision:
-    """Choose one verified registry candidate without allowing invented facts.
-
-    If the LLM fails or returns an invalid index, candidate 0 is preserved. This
-    makes the agent an arbitration layer rather than a new point of failure.
-    """
+    """Choose one verified registry candidate without allowing invented facts."""
     if not candidates:
         return RegistryDecision(-1, 0.0, True, "нет кандидатов", used_llm=False)
     if len(candidates) == 1:
@@ -140,3 +174,108 @@ async def choose_registry_primary(
         extra=log_extra(request_id),
     )
     return RegistryDecision(index, confidence, needs_review, reasoning)
+
+
+def _deterministic_workflow_fallback(stage: str, state: dict[str, Any], reason: str) -> WorkflowDecision:
+    items = state.get("items") if isinstance(state, dict) else None
+    if stage == "registry_review":
+        rows = items if isinstance(items, list) else []
+        unresolved = any(bool(row.get("unresolved")) for row in rows if isinstance(row, dict))
+        review = any(bool(row.get("needs_review")) for row in rows if isinstance(row, dict))
+        if unresolved or review:
+            return WorkflowDecision(
+                "ask_clarification",
+                0.0,
+                "По части позиций остаётся неоднозначность. Перед поиском поставщиков лучше уточнить изделие.",
+                "Пришлите точное наименование, модель/артикул или номер РУ по спорной позиции.",
+                reason,
+                used_llm=False,
+            )
+        return WorkflowDecision(
+            "search_suppliers",
+            0.0,
+            "Позиции идентифицированы достаточно уверенно — можно переходить к поиску производителя и поставщиков.",
+            reasoning=reason,
+            used_llm=False,
+        )
+    if stage == "supplier_search":
+        if bool(state.get("full_coverage")):
+            return WorkflowDecision(
+                "prepare_rfqs",
+                0.0,
+                "Есть подтверждённые каналы, закрывающие весь список. Следующий шаг — подготовить запросы КП.",
+                reasoning=reason,
+                used_llm=False,
+            )
+        if bool(state.get("split_plan")):
+            return WorkflowDecision(
+                "split_procurement",
+                0.0,
+                "Одного подтверждённого поставщика на весь список нет — закупку лучше разделить по найденным каналам.",
+                reasoning=reason,
+                used_llm=False,
+            )
+    return WorkflowDecision("finish", 0.0, "Текущий этап завершён.", reasoning=reason, used_llm=False)
+
+
+async def plan_procurement_next(
+    *,
+    stage: str,
+    state: dict[str, Any],
+    request_id: int | None = None,
+) -> WorkflowDecision:
+    """Plan the next step from tool-produced state only.
+
+    The model may choose only from WORKFLOW_ACTIONS. Invalid or unavailable LLM
+    output falls back to a conservative deterministic plan.
+    """
+    settings = get_settings()
+    payload = {
+        "stage": stage,
+        "state": state,
+        "constraints": {
+            "allowed_actions": sorted(WORKFLOW_ACTIONS),
+            "facts_must_come_only_from_state": True,
+        },
+    }
+    service = get_gemini_service()
+    try:
+        parsed = await service.generate_json(
+            parts=[Part(text=json.dumps(payload, ensure_ascii=False, indent=2, default=str))],
+            system_instruction=service.load_instruction("agent_workflow"),
+            schema=WORKFLOW_DECISION_SCHEMA,
+            model=getattr(settings, "llm_agent_model", settings.llm_report_model),
+            request_id=request_id,
+            operation=f"agent.workflow.{stage}",
+            temperature=0.0,
+        )
+    except GeminiError as exc:
+        logger.warning("Agent workflow fallback (%s): %s", stage, exc, extra=log_extra(request_id))
+        return _deterministic_workflow_fallback(stage, state, f"LLM недоступна: {exc}")
+
+    action = str(parsed.get("action") or "").strip()
+    if action not in WORKFLOW_ACTIONS:
+        logger.warning("Agent workflow invalid action %r", action, extra=log_extra(request_id))
+        return _deterministic_workflow_fallback(stage, state, "модель вернула недопустимое действие")
+    try:
+        confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0.0) or 0.0)))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    user_message = str(parsed.get("user_message") or "").strip()[:1200]
+    clarification = str(parsed.get("clarification_question") or "").strip()[:1200]
+    reasoning = str(parsed.get("reasoning") or "").strip()[:1600]
+
+    if action == "ask_clarification" and not clarification:
+        clarification = "Уточните точное наименование, модель/артикул или номер РУ по спорной позиции."
+    if not user_message:
+        user_message = _deterministic_workflow_fallback(stage, state, reasoning).user_message
+
+    logger.info(
+        "Agent workflow %s → %s confidence %.2f: %s",
+        stage,
+        action,
+        confidence,
+        reasoning,
+        extra=log_extra(request_id),
+    )
+    return WorkflowDecision(action, confidence, user_message, clarification, reasoning, used_llm=True)

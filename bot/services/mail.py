@@ -1,29 +1,29 @@
-"""Gmail: отправка запросов цены и приём ответов.
+"""Яндекс Почта: отправка запросов цены и приём ответов по SMTP/IMAP.
 
-Приём построен на опросе ``history.list`` раз в 3–5 минут. ``users.watch`` с
-Pub/Sub прикручивается, когда заявок станет много.
-
-Самое важное здесь — **порядок матчинга ответа с заявкой**. Он строго такой:
+Логика матчинга ответа с заявкой сохраняется прежней:
 
 1. ``In-Reply-To`` / ``References`` → наш ``Message-ID``;
-2. ``threadId`` Gmail;
+2. thread id, если провайдер его даёт;
 3. токен заявки в теме письма;
-4. адрес отправителя — **последним**.
+4. адрес отправителя — последним.
 
-Адрес стоит последним не для красоты: отвечают из общей почты, через
-секретаря, с личного ящика. Матч по адресу привяжет ответ не к той заявке, и
-заметить это будет некому — отсюда тесты именно на этот модуль.
+Сетевые вызовы ``imaplib``/``smtplib`` синхронные, поэтому выполняются через
+``asyncio.to_thread`` и не блокируют Telegram-бота.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
-import binascii
-import datetime as dt
+import imaplib
 import logging
 import re
+import smtplib
+import ssl
 from dataclasses import dataclass, field
-from email.message import EmailMessage
+from email import policy
+from email.message import EmailMessage, Message
+from email.parser import BytesParser
 from email.utils import formataddr, make_msgid, parseaddr
 from typing import Any
 
@@ -33,12 +33,8 @@ from bot.config import get_settings
 from bot.db import repo
 from bot.db.models import QuoteRequest
 from bot.logging_setup import log_extra
-from bot.services.http import ApiClient
 
 logger = logging.getLogger(__name__)
-
-TOKEN_URL = "https://oauth2.googleapis.com/token"  # noqa: S105 — это адрес, не секрет
-GMAIL_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
 
 TOKEN_RE = re.compile(r"\b(RFQ-\d{4}-\d+)\b", re.IGNORECASE)
 MESSAGE_ID_RE = re.compile(r"<[^<>\s]+>")
@@ -52,12 +48,13 @@ class MailError(RuntimeError):
 class ReplyHeaders:
     """Разобранные заголовки входящего письма."""
 
+    # Имя поля оставлено для совместимости с существующим scheduler.
     gmail_id: str = ""
     thread_id: str | None = None
     subject: str = ""
     from_email: str = ""
     from_name: str = ""
-    message_ids: list[str] = field(default_factory=list)  # из In-Reply-To и References
+    message_ids: list[str] = field(default_factory=list)
     body: str = ""
     attachments: list[dict[str, Any]] = field(default_factory=list)
 
@@ -69,17 +66,13 @@ class MatchResult:
 
 
 def extract_token(subject: str) -> str | None:
-    """Токен заявки из темы: ``[RFQ-2026-041] Re: Запрос цены`` → ``RFQ-2026-041``."""
+    """Токен заявки из темы: ``[RFQ-2026-041] Re: Запрос цены``."""
     match = TOKEN_RE.search(subject or "")
     return match.group(1).upper() if match else None
 
 
 def parse_message_ids(*header_values: str | None) -> list[str]:
-    """``In-Reply-To`` и ``References`` → список Message-ID в порядке появления.
-
-    В ``References`` их обычно несколько, и наш может быть любым из них: цепочка
-    могла успеть пройти через пересылку.
-    """
+    """``In-Reply-To`` и ``References`` → список Message-ID."""
     found: list[str] = []
     for value in header_values:
         if not value:
@@ -89,71 +82,6 @@ def parse_message_ids(*header_values: str | None) -> list[str]:
             if candidate not in found:
                 found.append(candidate)
     return found
-
-
-def _header(headers: list[dict[str, str]], name: str) -> str:
-    lowered = name.lower()
-    for item in headers:
-        if item.get("name", "").lower() == lowered:
-            return item.get("value", "")
-    return ""
-
-
-def _decode_b64url(data: str) -> bytes:
-    padding = "=" * (-len(data) % 4)
-    try:
-        return base64.urlsafe_b64decode(data + padding)
-    except (binascii.Error, ValueError):
-        return b""
-
-
-def _walk_parts(part: dict[str, Any]) -> list[dict[str, Any]]:
-    parts = [part]
-    for child in part.get("parts", []) or []:
-        parts.extend(_walk_parts(child))
-    return parts
-
-
-def parse_message(payload: dict[str, Any]) -> ReplyHeaders:
-    """Ответ Gmail API → структура, с которой работает матчинг."""
-    message_payload = payload.get("payload", {}) or {}
-    headers = message_payload.get("headers", []) or []
-    raw_from = _header(headers, "From")
-    name, address = parseaddr(raw_from)
-
-    body_text = ""
-    attachments: list[dict[str, Any]] = []
-    for part in _walk_parts(message_payload):
-        mime = part.get("mimeType", "")
-        body = part.get("body", {}) or {}
-        filename = part.get("filename") or ""
-        if filename and body.get("attachmentId"):
-            attachments.append(
-                {
-                    "filename": filename,
-                    "attachment_id": body["attachmentId"],
-                    "mime_type": mime,
-                    "size": body.get("size", 0),
-                }
-            )
-        elif mime == "text/plain" and body.get("data") and not body_text:
-            body_text = _decode_b64url(body["data"]).decode("utf-8", errors="replace")
-
-    if not body_text:
-        body_text = str(payload.get("snippet") or "")
-
-    return ReplyHeaders(
-        gmail_id=str(payload.get("id") or ""),
-        thread_id=str(payload.get("threadId") or "") or None,
-        subject=_header(headers, "Subject"),
-        from_email=address.lower(),
-        from_name=name,
-        message_ids=parse_message_ids(
-            _header(headers, "In-Reply-To"), _header(headers, "References")
-        ),
-        body=body_text,
-        attachments=attachments,
-    )
 
 
 async def match_quote(session: AsyncSession, headers: ReplyHeaders) -> MatchResult:
@@ -174,8 +102,6 @@ async def match_quote(session: AsyncSession, headers: ReplyHeaders) -> MatchResu
         if quote is not None:
             return MatchResult(quote, "token")
 
-    # Последний шаг и самый ненадёжный. Берётся только незакрытый запрос —
-    # иначе старая переписка перехватит свежий ответ.
     if headers.from_email:
         quote = await repo.find_quote_by_sender(session, headers.from_email)
         if quote is not None:
@@ -185,8 +111,7 @@ async def match_quote(session: AsyncSession, headers: ReplyHeaders) -> MatchResu
 
 
 def new_message_id(sender: str) -> str:
-    """Свой ``Message-ID``. Генерируется до отправки и до записи в базу:
-    по нему потом находится ответ и проверяется, ушло ли письмо после сбоя."""
+    """Сгенерировать Message-ID до отправки, чтобы потом матчить ответ."""
     return make_msgid(domain=sender.split("@")[-1] if "@" in sender else None)
 
 
@@ -202,10 +127,8 @@ def build_message(
 ) -> tuple[str, str]:
     """Собрать письмо. Возвращает ``(base64url MIME, Message-ID)``.
 
-    Свой ``Message-ID`` ставится намеренно: по нему потом находится ответ, и
-    знать его надо до отправки, а не выковыривать из ответа Gmail. Обычно он
-    уже зарезервирован в ``quote_requests`` и передаётся сюда.
-    Токен в теме обязателен — это третий шаг матчинга.
+    Формат возврата оставлен прежним, чтобы не ломать существующие тесты и
+    вызывающий код после перехода с Gmail API на SMTP.
     """
     message = EmailMessage()
     message["Subject"] = f"[{token}] {subject_suffix}"
@@ -218,89 +141,159 @@ def build_message(
     return raw, message_id
 
 
+def _decode_raw_message(raw_b64: str) -> bytes:
+    padding = "=" * (-len(raw_b64) % 4)
+    return base64.urlsafe_b64decode(raw_b64 + padding)
+
+
+def _plain_body(message: Message) -> str:
+    """Получить читаемое тело письма, предпочитая text/plain."""
+    if message.is_multipart():
+        body = message.get_body(preferencelist=("plain", "html"))
+        if body is None:
+            return ""
+        try:
+            return body.get_content()
+        except Exception:
+            payload = body.get_payload(decode=True) or b""
+            return payload.decode(body.get_content_charset() or "utf-8", errors="replace")
+
+    try:
+        return message.get_content()
+    except Exception:
+        payload = message.get_payload(decode=True) or b""
+        return payload.decode(message.get_content_charset() or "utf-8", errors="replace")
+
+
+def _attachment_parts(message: Message) -> list[Message]:
+    result: list[Message] = []
+    if not message.is_multipart():
+        return result
+    for part in message.walk():
+        if part.is_multipart():
+            continue
+        filename = part.get_filename()
+        disposition = part.get_content_disposition()
+        if filename or disposition == "attachment":
+            result.append(part)
+    return result
+
+
+def _parse_rfc822(raw: bytes, uid: str) -> ReplyHeaders:
+    message = BytesParser(policy=policy.default).parsebytes(raw)
+    name, address = parseaddr(str(message.get("From", "")))
+    attachments: list[dict[str, Any]] = []
+    for index, part in enumerate(_attachment_parts(message)):
+        payload = part.get_payload(decode=True) or b""
+        attachments.append(
+            {
+                "filename": part.get_filename() or f"attachment-{index + 1}",
+                "attachment_id": str(index),
+                "mime_type": part.get_content_type(),
+                "size": len(payload),
+            }
+        )
+
+    return ReplyHeaders(
+        gmail_id=uid,
+        thread_id=None,
+        subject=str(message.get("Subject", "")),
+        from_email=address.lower(),
+        from_name=name,
+        message_ids=parse_message_ids(
+            str(message.get("In-Reply-To", "")),
+            str(message.get("References", "")),
+        ),
+        body=_plain_body(message),
+        attachments=attachments,
+    )
+
+
 class MailService:
     def __init__(self) -> None:
-        settings = get_settings()
-        self._settings = settings
-        self._client = ApiClient("gmail", timeout_read=60.0)
-        self._access_token: str | None = None
-        self._expires_at: dt.datetime = dt.datetime.min.replace(tzinfo=dt.UTC)
+        self._settings = get_settings()
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        # Соединения открываются на одну операцию; постоянного клиента нет.
+        return None
 
-    async def _token(self, request_id: int | None = None) -> str:
-        """Access-token с запасом в минуту до истечения."""
-        settings = self._settings
-        if not settings.gmail_enabled:
-            raise MailError("Gmail не настроен")
+    def _require_enabled(self) -> None:
+        if not self._settings.yandex_mail_enabled:
+            raise MailError("Яндекс Почта не настроена")
 
-        now = dt.datetime.now(dt.UTC)
-        if self._access_token and now < self._expires_at:
-            return self._access_token
+    def _imap_connect(self) -> imaplib.IMAP4_SSL:
+        self._require_enabled()
+        try:
+            client = imaplib.IMAP4_SSL(
+                self._settings.imap_host,
+                self._settings.imap_port,
+                ssl_context=ssl.create_default_context(),
+                timeout=30,
+            )
+            client.login(self._settings.yandex_email, self._settings.yandex_app_password)
+            status, _ = client.select("INBOX", readonly=True)
+            if status != "OK":
+                client.logout()
+                raise MailError("не удалось открыть INBOX Яндекс Почты")
+            return client
+        except MailError:
+            raise
+        except Exception as exc:
+            raise MailError(f"не удалось подключиться к Яндекс IMAP: {exc}") from exc
 
-        result = await self._client.post(
-            TOKEN_URL,
-            operation="oauth.refresh",
-            request_id=request_id,
-            # В ответе приходят access_token и refresh_token. Одна отладочная
-            # строка с CallResult — и токен в файле лога.
-            redact_body=True,
-            data={
-                "client_id": settings.google_client_id,
-                "client_secret": settings.google_client_secret,
-                "refresh_token": settings.google_refresh_token,
-                "grant_type": "refresh_token",
-            },
-        )
-        if not result.ok:
-            raise MailError(f"не удалось обновить токен Google: {result.error}")
+    def _smtp_send_bytes(self, raw: bytes, recipients: list[str]) -> None:
+        self._require_enabled()
+        try:
+            with smtplib.SMTP_SSL(
+                self._settings.smtp_host,
+                self._settings.smtp_port,
+                context=ssl.create_default_context(),
+                timeout=30,
+            ) as smtp:
+                smtp.login(self._settings.yandex_email, self._settings.yandex_app_password)
+                smtp.sendmail(self._settings.yandex_email, recipients, raw)
+        except Exception as exc:
+            raise MailError(f"письмо не отправлено через Яндекс SMTP: {exc}") from exc
 
-        payload = result.json or {}
-        token = payload.get("access_token")
-        if not token:
-            raise MailError("Google не вернул access_token")
-        self._access_token = str(token)
-        self._expires_at = now + dt.timedelta(seconds=int(payload.get("expires_in", 3600)) - 60)
-        return self._access_token
+    def _all_uids_sync(self) -> list[str]:
+        client = self._imap_connect()
+        try:
+            status, data = client.uid("search", None, "ALL")
+            if status != "OK" or not data:
+                return []
+            return [item.decode("ascii") for item in data[0].split() if item]
+        finally:
+            try:
+                client.logout()
+            except Exception:
+                pass
 
-    async def _auth_headers(self, request_id: int | None = None) -> dict[str, str]:
-        return {"Authorization": f"Bearer {await self._token(request_id)}"}
+    def _fetch_raw_sync(self, uid: str) -> bytes | None:
+        client = self._imap_connect()
+        try:
+            status, data = client.uid("fetch", uid, "(RFC822)")
+            if status != "OK" or not data:
+                return None
+            for item in data:
+                if isinstance(item, tuple) and len(item) >= 2:
+                    return bytes(item[1])
+            return None
+        finally:
+            try:
+                client.logout()
+            except Exception:
+                pass
 
     async def find_sent_by_message_id(
         self, message_id: str, *, request_id: int | None = None
     ) -> str | None:
-        """Есть ли в ящике уже отправленное письмо с таким ``Message-ID``.
+        """Проверка исходящих после неясного SMTP-сбоя.
 
-        Возвращает ``threadId`` найденного письма, иначе ``None``. Нужно после
-        неясного сбоя отправки: Gmail мог принять письмо и не успеть ответить.
+        Имена папки «Отправленные» зависят от языка/настроек Яндекса. Чтобы не
+        делать опасный поиск по неверной папке, здесь не предпринимается
+        автоматический повтор: SMTP-ошибка сразу поднимается вызывающему коду.
         """
-        result = await self._client.get(
-            f"{GMAIL_BASE}/messages",
-            operation="messages.list.byMsgId",
-            request_id=request_id,
-            headers=await self._auth_headers(request_id),
-            params={"q": f"rfc822msgid:{message_id.strip('<>')}", "maxResults": 1},
-        )
-        if not result.ok:
-            return None
-        messages = (result.json or {}).get("messages") or []
-        if not messages:
-            return None
-        found_id = str(messages[0].get("id") or "")
-        if not found_id:
-            return None
-
-        details = await self._client.get(
-            f"{GMAIL_BASE}/messages/{found_id}",
-            operation="messages.get.byMsgId",
-            request_id=request_id,
-            headers=await self._auth_headers(request_id),
-            params={"format": "minimal"},
-        )
-        if not details.ok:
-            return None
-        return str((details.json or {}).get("threadId") or "")
+        return None
 
     async def send(
         self,
@@ -312,17 +305,9 @@ class MailService:
         request_id: int | None = None,
         message_id: str | None = None,
     ) -> tuple[str, str]:
-        """Отправить письмо. Возвращает ``(threadId, Message-ID)``.
-
-        Ретраев здесь нет намеренно. Отправка не идемпотентна: Gmail мог
-        принять письмо и не успеть ответить, и слепой повтор отправил бы
-        поставщику второй такой же запрос. Вместо повтора — проверка по
-        собственному ``Message-ID``, который ставится до отправки: если письмо
-        в ящике уже есть, значит оно ушло, и повторять нечего.
-        """
         settings = self._settings
-        raw, message_id = build_message(
-            sender=settings.gmail_sender,
+        raw_b64, message_id = build_message(
+            sender=settings.yandex_email,
             sender_name="",
             to=to,
             token=token,
@@ -330,39 +315,17 @@ class MailService:
             body=body,
             message_id=message_id,
         )
-        result = await self._client.post(
-            f"{GMAIL_BASE}/messages/send",
-            operation="messages.send",
-            request_id=request_id,
-            headers=await self._auth_headers(request_id),
-            json={"raw": raw},
-            retries=0,
-        )
-
-        if not result.ok:
-            # Сбой мог случиться и после того, как Gmail принял письмо.
-            # Прежде чем сказать «не отправлено», смотрим, нет ли его в ящике.
-            existing_thread = await self.find_sent_by_message_id(message_id, request_id=request_id)
-            if existing_thread is not None:
-                logger.warning(
-                    "Отправка вернула ошибку (%s), но письмо в ящике есть — "
-                    "считаем отправленным",
-                    result.error,
-                    extra=log_extra(request_id),
-                )
-                return existing_thread, message_id
-            raise MailError(f"письмо не отправлено: {result.error}")
-
-        payload = result.json or {}
-        thread_id = str(payload.get("threadId") or "")
+        await asyncio.to_thread(self._smtp_send_bytes, _decode_raw_message(raw_b64), [to])
         logger.info(
-            "Письмо отправлено на %s, thread=%s, msgid=%s",
+            "Письмо отправлено через Яндекс на %s, msgid=%s",
             to,
-            thread_id,
             message_id,
             extra=log_extra(request_id),
         )
-        return thread_id, message_id
+        # В Яндекс IMAP нет Gmail threadId; Message-ID используем как стабильный
+        # технический идентификатор. Основной матчинг ответа всё равно идёт по
+        # In-Reply-To/References.
+        return message_id, message_id
 
     async def forward_file(
         self,
@@ -373,15 +336,11 @@ class MailService:
         mime_type: str,
         request_id: int | None = None,
     ) -> None:
-        """Переслать приложенный файл без обработки (команда владельца)."""
         message = EmailMessage()
         message["Subject"] = f"Файл из Telegram: {filename}"
-        message["From"] = self._settings.gmail_sender
+        message["From"] = self._settings.yandex_email
         message["To"] = to
-        # Тот же приём, что у send: свой Message-ID до отправки, чтобы после
-        # неясного сбоя проверить ящик, а не пересылать файл второй раз.
-        message_id = new_message_id(self._settings.gmail_sender)
-        message["Message-ID"] = message_id
+        message["Message-ID"] = new_message_id(self._settings.yandex_email)
         message.set_content("Файл переслан ботом подбора поставщиков.")
         maintype, _, subtype = mime_type.partition("/")
         message.add_attachment(
@@ -390,128 +349,67 @@ class MailService:
             subtype=subtype or "octet-stream",
             filename=filename,
         )
-        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
-        result = await self._client.post(
-            f"{GMAIL_BASE}/messages/send",
-            operation="messages.forward",
-            request_id=request_id,
-            headers=await self._auth_headers(request_id),
-            json={"raw": raw},
-            retries=0,  # отправка не идемпотентна
-        )
-        if not result.ok:
-            if await self.find_sent_by_message_id(message_id, request_id=request_id) is not None:
-                logger.warning(
-                    "Пересылка вернула ошибку (%s), но письмо в ящике есть — считаем ушедшим",
-                    result.error,
-                    extra=log_extra(request_id),
-                )
-                return
-            raise MailError(f"файл не переслан: {result.error}")
+        await asyncio.to_thread(self._smtp_send_bytes, message.as_bytes(), [to])
+        logger.info("Файл %s переслан через Яндекс на %s", filename, to, extra=log_extra(request_id))
 
     async def current_history_id(self, request_id: int | None = None) -> str | None:
-        result = await self._client.get(
-            f"{GMAIL_BASE}/profile",
-            operation="users.profile",
-            request_id=request_id,
-            headers=await self._auth_headers(request_id),
-        )
-        if not result.ok:
-            return None
-        return str((result.json or {}).get("historyId") or "") or None
+        """Точка отсчёта для IMAP: максимальный UID во входящих."""
+        uids = await asyncio.to_thread(self._all_uids_sync)
+        return max(uids, key=int) if uids else "0"
 
     async def new_message_ids(
         self, start_history_id: str, *, request_id: int | None = None
     ) -> tuple[list[str], str | None]:
-        """Новые входящие с момента ``start_history_id``.
+        """Новые входящие после сохранённого UID.
 
-        Возвращает ``(id писем, новый historyId)``. Если Gmail сообщил, что
-        историю потеряли (404), новый historyId придётся взять из профиля —
-        иначе опрос застрянет навсегда.
+        Название метода оставлено прежним, чтобы не менять слой scheduler/DB.
         """
-        message_ids: list[str] = []
-        page_token: str | None = None
-        latest: str | None = None
+        uids = await asyncio.to_thread(self._all_uids_sync)
+        if not uids:
+            return [], "0"
 
-        while True:
-            params: dict[str, Any] = {
-                "startHistoryId": start_history_id,
-                "historyTypes": "messageAdded",
-                "labelId": "INBOX",
-            }
-            if page_token:
-                params["pageToken"] = page_token
+        latest = max(uids, key=int)
+        try:
+            start = int(start_history_id)
+        except (TypeError, ValueError):
+            start = int(latest)
 
-            result = await self._client.get(
-                f"{GMAIL_BASE}/history",
-                operation="history.list",
-                request_id=request_id,
-                headers=await self._auth_headers(request_id),
-                params=params,
-            )
-            if not result.ok:
-                if result.status_code == 404:
-                    logger.warning("Gmail потерял историю — беру historyId из профиля")
-                    return [], await self.current_history_id(request_id)
-                logger.warning("history.list не ответил: %s", result.error)
-                return [], None
+        # Если в БД остался старый Gmail historyId, не зависаем навсегда:
+        # считаем текущий UID новой точкой отсчёта и старую почту не разбираем.
+        if start > int(latest):
+            return [], latest
 
-            payload = result.json or {}
-            latest = str(payload.get("historyId") or "") or latest
-            for record in payload.get("history", []) or []:
-                for added in record.get("messagesAdded", []) or []:
-                    message = added.get("message", {})
-                    msg_id = str(message.get("id") or "")
-                    if msg_id and msg_id not in message_ids:
-                        message_ids.append(msg_id)
-
-            page_token = payload.get("nextPageToken")
-            if not page_token:
-                break
-
-        return message_ids, latest
+        fresh = [uid for uid in uids if int(uid) > start]
+        return fresh, latest
 
     async def get_message(
         self, message_id: str, *, request_id: int | None = None, full: bool = True
     ) -> ReplyHeaders | None:
-        """Письмо целиком (``full=True``) или только заголовки и фрагмент.
-
-        Матчингу нужны лишь заголовки и ``threadId`` — их даёт дешёвый
-        ``format=metadata``. Тело со всеми частями качается только для
-        письма, которое привязалось к заявке: в ящик приходит не только
-        почта поставщиков.
-        """
-        params: dict[str, Any] = {"format": "full"}
-        if not full:
-            params = {
-                "format": "metadata",
-                "metadataHeaders": ["From", "Subject", "In-Reply-To", "References"],
-            }
-        result = await self._client.get(
-            f"{GMAIL_BASE}/messages/{message_id}",
-            operation="messages.get" if full else "messages.get.metadata",
-            request_id=request_id,
-            headers=await self._auth_headers(request_id),
-            params=params,
-        )
-        if not result.ok:
-            logger.warning("Не удалось прочитать письмо %s: %s", message_id, result.error)
+        raw = await asyncio.to_thread(self._fetch_raw_sync, message_id)
+        if raw is None:
+            logger.warning("Не удалось прочитать письмо UID=%s", message_id)
             return None
-        return parse_message(result.json or {})
+        parsed = _parse_rfc822(raw, message_id)
+        if not full:
+            # Метаданные уже разобраны; тело и вложения не нужны на первом шаге.
+            parsed.body = ""
+            parsed.attachments = []
+        return parsed
 
     async def download_attachment(
         self, message_id: str, attachment_id: str, *, request_id: int | None = None
     ) -> bytes | None:
-        result = await self._client.get(
-            f"{GMAIL_BASE}/messages/{message_id}/attachments/{attachment_id}",
-            operation="messages.attachments",
-            request_id=request_id,
-            headers=await self._auth_headers(request_id),
-        )
-        if not result.ok:
+        raw = await asyncio.to_thread(self._fetch_raw_sync, message_id)
+        if raw is None:
             return None
-        data = (result.json or {}).get("data")
-        return _decode_b64url(str(data)) if data else None
+        message = BytesParser(policy=policy.default).parsebytes(raw)
+        parts = _attachment_parts(message)
+        try:
+            index = int(attachment_id)
+            part = parts[index]
+        except (ValueError, IndexError):
+            return None
+        return part.get_payload(decode=True) or b""
 
 
 _service: MailService | None = None

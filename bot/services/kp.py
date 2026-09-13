@@ -1,20 +1,13 @@
-"""Коммерческое предложение: извлечение цен из письма и сборка PDF.
+"""Коммерческое предложение: извлечение закупочных цен и сборка PDF.
 
-Порядок из ТЗ, менять нельзя:
+Порядок:
+1. модель вытаскивает из письма поставщика позиции и закупочные цены;
+2. владелец видит закупочную цену и расчётную продажную цену;
+3. только после подтверждения собирается PDF с продажной ценой.
 
-1. модель вытаскивает из письма позиции и цены в JSON;
-2. **числа показываются владельцу на подтверждение в Telegram**;
-3. только после подтверждения собирается PDF.
-
-Цены в письмах приходят с оговорками — «без НДС», «от 10 штук», «при 100%
-предоплате». Поэтому оговорки извлекаются отдельными полями, а не мнутся в
-одно число: неверно вытащенная цена уйдёт клиенту под печатью владельца.
-
-Печать и подпись ставятся только на финальную версию. Черновик — всегда
-``--no-stamp``, и обойти это правило автоматизацией нельзя: флаг здесь
-вычисляется из явного аргумента ``final``, значение по умолчанию — черновик.
+Базовый коэффициент продажи MEDISENT — 1.8. Закупочная цена при этом не
+теряется: она остаётся в Extraction и в quote_requests для аналитики.
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -24,7 +17,7 @@ import logging
 import sys
 import tempfile
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
@@ -35,11 +28,10 @@ from bot.services.gemini import GeminiError, Part, get_gemini_service
 
 logger = logging.getLogger(__name__)
 
-# Порог «похоже на ошибку на порядок»: цена отличается от медианы по позициям
-# больше чем в 20 раз. Скрипт сборки цены не проверяет — это делаем мы.
 ORDER_OF_MAGNITUDE_FACTOR = Decimal(20)
-
 VALID_UNTIL_DAYS = 14
+BASE_SALES_COEFFICIENT = Decimal("1.8")
+MONEY_QUANT = Decimal("0.01")
 
 EXTRACTION_SCHEMA: dict[str, Any] = {
     "type": "OBJECT",
@@ -72,6 +64,11 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
 }
 
 
+def sales_price(price: Decimal, coefficient: Decimal = BASE_SALES_COEFFICIENT) -> Decimal:
+    """Продажная цена с денежным округлением до копеек."""
+    return (price * coefficient).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
+
+
 @dataclass(slots=True)
 class ExtractedItem:
     name: str
@@ -86,11 +83,19 @@ class ExtractedItem:
 
     @property
     def total(self) -> Decimal:
-        return (self.qty * self.price).quantize(Decimal("0.01"))
+        """Закупочная сумма позиции."""
+        return (self.qty * self.price).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
+
+    @property
+    def sale_price(self) -> Decimal:
+        return sales_price(self.price)
+
+    @property
+    def sale_total(self) -> Decimal:
+        return (self.qty * self.sale_price).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
 
     @property
     def caveats(self) -> list[str]:
-        """Все оговорки одной строкой — их владелец и должен увидеть."""
         out: list[str] = []
         if self.vat_included is False:
             out.append("без НДС")
@@ -118,14 +123,15 @@ class Extraction:
 
     @property
     def total(self) -> Decimal:
+        """Закупочная сумма всего ответа поставщика."""
         return sum((item.total for item in self.items), Decimal(0))
 
-    def suspicious_items(self) -> list[ExtractedItem]:
-        """Позиции, чья цена отличается от медианы на порядок и больше.
+    @property
+    def sale_total(self) -> Decimal:
+        """Расчётная сумма продажи по базовому коэффициенту."""
+        return sum((item.sale_total for item in self.items), Decimal(0))
 
-        ТЗ: цена, похожая на ошибку на порядок, — повод спросить, а не
-        промолчать. Скрипт сборки цены не проверяет, только считает суммы.
-        """
+    def suspicious_items(self) -> list[ExtractedItem]:
         prices = sorted(item.price for item in self.items if item.price > 0)
         if len(prices) < 3:
             return []
@@ -155,17 +161,10 @@ async def extract_from_letter(
     attachments_text: str = "",
     request_id: int | None = None,
 ) -> Extraction:
-    """Разобрать письмо поставщика.
-
-    Текст письма — чужой, поэтому идёт в модель через ``guard``: в письме от
-    незнакомого адресата может лежать и цена, и попытка перехвата инструкций.
-    """
     combined = letter_text
     if attachments_text:
         combined += f"\n\n--- из вложений ---\n{attachments_text}"
-
     safe = await guard.sanitise_for_model(combined, source="письмо поставщика")
-
     try:
         gemini = get_gemini_service()
         parsed = await gemini.generate_json(
@@ -202,7 +201,6 @@ async def extract_from_letter(
                 caveat=str(row.get("caveat") or ""),
             )
         )
-
     notes = parsed.get("notes") or []
     return Extraction(
         items=items,
@@ -215,18 +213,11 @@ async def extract_from_letter(
 
 
 def read_pdf_attachment(content: bytes) -> str:
-    """Текст и таблицы из PDF-прайса поставщика.
-
-    Прайсы приходят вложением, и цена в них обычно в таблице, а не в тексте
-    письма. Таблицы вытаскиваются отдельно: без них строки прайса склеиваются
-    в кашу и модель читает их неверно.
-    """
     try:
         import pdfplumber
     except ImportError:
         logger.warning("pdfplumber не установлен — вложение PDF пропущено")
         return ""
-
     chunks: list[str] = []
     with tempfile.NamedTemporaryFile(suffix=".pdf") as handle:
         handle.write(content)
@@ -258,12 +249,7 @@ def build_kp_json(
     client_name: str,
     intro: str = "",
 ) -> tuple[dict[str, Any], str | None]:
-    """Собрать входной JSON для ``build_kp.py``.
-
-    Возвращает ``(данные, предупреждение)``. Предупреждение непустое, если
-    ``valid_until`` пришлось проставить самим: правило скилла — сообщить об
-    этом владельцу, а не проставить молча.
-    """
+    """Собрать КП с продажными ценами; закупочные остаются только внутри системы."""
     today = dt.date.today()
     warning: str | None = None
     valid_until = extraction.valid_until.strip()
@@ -292,7 +278,7 @@ def build_kp_json(
                 "note": "; ".join(filter(None, [item.note, *item.caveats])),
                 "qty": float(item.qty),
                 "unit": item.unit,
-                "price": float(item.price),
+                "price": float(item.sale_price),
             }
             for item in extraction.items
         ],
@@ -304,7 +290,6 @@ def build_kp_json(
 
 
 def check_assets() -> list[str]:
-    """Проверить логотип, печать и подпись. Возвращает список отсутствующих."""
     settings = get_settings()
     missing: list[str] = []
     for name in ("logo.png", "stamp.png", "signature.png"):
@@ -320,28 +305,18 @@ async def build_pdf(
     final: bool = False,
     request_id: int | None = None,
 ) -> tuple[bool, str]:
-    """Собрать PDF скриптом скилла. Возвращает ``(успех, вывод скрипта)``.
-
-    ``final=False`` — черновик, идёт с ``--no-stamp``. Значение по умолчанию
-    именно такое: печать и подпись должны требовать явного решения, а не
-    получаться сами собой.
-    """
     settings = get_settings()
     kp_dir = Path(settings.kp_builder_dir)
     script = kp_dir / "scripts" / "build_kp.py"
     if not script.exists():
         return False, f"нет скрипта сборки {script}"
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
-
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as handle:
         json.dump(data, handle, ensure_ascii=False, indent=2)
         data_path = Path(handle.name)
-
     args = [sys.executable, str(script), "--data", str(data_path), "--out", str(out_path)]
     if not final:
         args.append("--no-stamp")
-
     logger.info(
         "Сборка КП: %s",
         "финальная с печатью" if final else "черновик без печати",
@@ -366,15 +341,8 @@ async def build_pdf(
         await asyncio.to_thread(data_path.unlink, True)
 
 
-# --- Сериализация для таблицы одобрений ----------------------------------
-#
-# В одобрении хранится ровно то, что показали владельцу. Собирается КП потом
-# из этой записи, а не из свежего разбора письма: между показом и нажатием
-# «Да» модель могла бы разобрать письмо иначе.
-
-
 def extraction_to_payload(extraction: Extraction) -> dict[str, Any]:
-    """Разбор цен → JSON для колонки ``approvals.payload``."""
+    """Закупочные цены сохраняются в одобрении; продажные всегда пересчитываются по политике."""
     return {
         "currency": extraction.currency,
         "lead_time": extraction.lead_time,
@@ -390,9 +358,7 @@ def extraction_to_payload(extraction: Extraction) -> dict[str, Any]:
                 "note": item.note,
                 "vat_included": item.vat_included,
                 "min_qty": str(item.min_qty) if item.min_qty is not None else None,
-                "prepayment_pct": (
-                    str(item.prepayment_pct) if item.prepayment_pct is not None else None
-                ),
+                "prepayment_pct": str(item.prepayment_pct) if item.prepayment_pct is not None else None,
                 "caveat": item.caveat,
             }
             for item in extraction.items
@@ -401,8 +367,6 @@ def extraction_to_payload(extraction: Extraction) -> dict[str, Any]:
 
 
 def extraction_from_payload(payload: dict[str, Any]) -> Extraction:
-    """Обратно из одобрения. Decimal восстанавливается из строк, а не из float:
-    цена в документе с подписью не должна поехать на копейку."""
     items = [
         ExtractedItem(
             name=str(row.get("name", "")),
@@ -412,9 +376,7 @@ def extraction_from_payload(payload: dict[str, Any]) -> Extraction:
             note=str(row.get("note", "")),
             vat_included=row.get("vat_included"),
             min_qty=Decimal(str(row["min_qty"])) if row.get("min_qty") else None,
-            prepayment_pct=(
-                Decimal(str(row["prepayment_pct"])) if row.get("prepayment_pct") else None
-            ),
+            prepayment_pct=Decimal(str(row["prepayment_pct"])) if row.get("prepayment_pct") else None,
             caveat=str(row.get("caveat", "")),
         )
         for row in payload.get("items", [])

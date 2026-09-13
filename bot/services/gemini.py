@@ -2,9 +2,9 @@
 
 Изображения и аудио модель берёт нативно, отдельный Whisper не нужен.
 
-Общее правило для всех вызовов отсюда: модель получает JSON и возвращает JSON
-по заданной схеме. Свободный текст не принимается — на нём номера РУ и цены
-поплывут не сразу, а на десятом прогоне, и заметить это будет некому.
+В бесплатном режиме простые текстовые заявки, ранжирование кандидатов и
+черновики писем обрабатываются локально и не расходуют суточную квоту Gemini.
+Gemini остаётся для фото, голоса, файлов и других действительно сложных задач.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -61,7 +62,7 @@ class ProductRequest:
     requirements: list[str] = field(default_factory=list)
     raw_input: str = ""
     confidence: float = 1.0
-    transcript: str | None = None  # для голосовых: что именно услышали
+    transcript: str | None = None
 
     @property
     def recognised(self) -> bool:
@@ -72,8 +73,6 @@ class ProductRequest:
             "-",
         )
 
-
-# --- Схемы структурированного вывода -------------------------------------
 
 PRODUCT_SCHEMA: dict[str, Any] = {
     "type": "OBJECT",
@@ -88,6 +87,141 @@ PRODUCT_SCHEMA: dict[str, Any] = {
 }
 
 
+_QTY_RE = re.compile(
+    r"(?P<qty>\d[\d\s]*(?:[.,]\d+)?)\s*(?P<unit>шт\.?|штук(?:а|и)?|уп(?:ак(?:овк[аи])?)?\.?|компл(?:ект(?:а|ов)?)?\.?|короб(?:ка|ки|ок)?)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_text_locally(text: str) -> ProductRequest:
+    """Разобрать обычную текстовую заявку без LLM и без расхода Gemini."""
+    raw = " ".join((text or "").strip().split())
+    if not raw:
+        return ProductRequest(product="", raw_input=text)
+
+    match = _QTY_RE.search(raw)
+    qty = match.group(0).strip() if match else "не указано"
+    product = raw
+    if match:
+        product = (raw[: match.start()] + " " + raw[match.end() :]).strip(" ,;:-")
+
+    product = re.sub(
+        r"^(?:нуж(?:ен|на|но|ны)|требуется|ищем|закупаем|купить|запрос(?:ить)?(?:\s+кп)?(?:\s+на)?)\s+",
+        "",
+        product,
+        flags=re.IGNORECASE,
+    ).strip(" ,;:-")
+    return ProductRequest(product=product or raw, qty=qty, raw_input=text, confidence=1.0)
+
+
+def _local_rank(payload: dict[str, Any]) -> dict[str, Any]:
+    """Детерминированное ранжирование без LLM.
+
+    Оцениваются только факты, уже собранные конвейером: наличие на сайте,
+    состояние РУ, контакты и опубликованная цена. Никаких выдуманных признаков.
+    """
+    ranked: list[tuple[int, int, dict[str, Any], list[str]]] = []
+    for index, candidate in enumerate(payload.get("candidates") or []):
+        if not isinstance(candidate, dict):
+            continue
+        score = 0
+        reasons: list[str] = []
+        concerns: list[str] = []
+
+        site_claims = candidate.get("site_claims")
+        if site_claims is True:
+            score += 50
+            reasons.append("на сайте найдено подтверждение товара")
+        elif site_claims is False:
+            score -= 20
+            concerns.append("на сайте товар не подтверждён")
+        else:
+            concerns.append("сайт не дал подтверждения товара")
+
+        registry = candidate.get("registry") or {}
+        if isinstance(registry, dict):
+            state = str(registry.get("state") or "")
+            ru_valid = registry.get("ru_valid")
+            if state == "found" and ru_valid is True:
+                score += 30
+                reasons.append("найдено действующее РУ на изделие")
+            elif state == "found":
+                score += 10
+                reasons.append("РУ найдено, статус требует внимания")
+            elif state == "unavailable":
+                concerns.append("реестр РУ был недоступен")
+            elif state == "not_found":
+                score -= 10
+                concerns.append("РУ не найдено")
+
+        if candidate.get("email"):
+            score += 15
+            reasons.append("есть e-mail")
+        if candidate.get("phone"):
+            score += 5
+            reasons.append("есть телефон")
+        if candidate.get("site_price") is not None:
+            score += 10
+            reasons.append("есть опубликованная цена")
+
+        flags = candidate.get("unrega_flags") or []
+        if isinstance(flags, list) and flags:
+            score -= min(15, 5 * len(flags))
+            concerns.append("есть информационные письма, требуется ручная проверка")
+
+        reason = "; ".join(reasons) if reasons else "данных для преимущества немного"
+        ranked.append((score, index, {"id": candidate.get("id"), "reason": reason}, concerns))
+
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    rows = []
+    for rank, (_, _, base, concerns) in enumerate(ranked, start=1):
+        rows.append({"id": base["id"], "rank": rank, "reason": base["reason"], "concerns": concerns})
+
+    missing: list[str] = []
+    if any((c.get("registry") or {}).get("state") == "unavailable" for c in payload.get("candidates") or [] if isinstance(c, dict)):
+        missing.append("проверка РУ недоступна")
+    return {
+        "ranked": rows,
+        "summary": "Рейтинг рассчитан локально без Gemini по подтверждённым данным сайта, РУ, контактам и цене.",
+        "missing_data": missing,
+    }
+
+
+def _local_email(payload: dict[str, Any]) -> dict[str, Any]:
+    product = str(payload.get("product") or "изделие").strip()
+    qty = str(payload.get("qty") or "не указано").strip()
+    supplier = payload.get("supplier") or {}
+    supplier_name = str(supplier.get("name") or "").strip() if isinstance(supplier, dict) else ""
+    requirements = payload.get("requirements") or []
+    token = str(payload.get("token") or "").strip()
+
+    greeting = f"Добрый день, коллеги из {supplier_name}!" if supplier_name else "Добрый день!"
+    lines = [
+        greeting,
+        "",
+        f"Просим предоставить коммерческое предложение на: {product}.",
+    ]
+    if qty and qty != "не указано":
+        lines.append(f"Количество: {qty}.")
+    if isinstance(requirements, list) and requirements:
+        lines.append("Требования: " + "; ".join(str(x) for x in requirements if str(x).strip()) + ".")
+    lines.extend(
+        [
+            "",
+            "Просим указать цену, срок поставки, наличие, производителя и номер регистрационного удостоверения (при наличии).",
+            "Также просим приложить карточку предприятия или реквизиты для оформления заказа.",
+        ]
+    )
+    if token:
+        lines.extend(["", f"Внутренний номер запроса: {token}."])
+    lines.extend(["", "Заранее благодарим за ответ."])
+    return {
+        "subject_suffix": f"Запрос КП — {product}",
+        "body": "\n".join(lines),
+        "questions": [],
+    }
+
+
 class GeminiService:
     def __init__(self) -> None:
         settings = get_settings()
@@ -96,7 +230,7 @@ class GeminiService:
             "gemini",
             base_url=API_BASE,
             headers={"Content-Type": "application/json"},
-            timeout_read=120.0,  # мультимодальный запрос считается долго
+            timeout_read=120.0,
         )
 
     async def aclose(self) -> None:
@@ -113,12 +247,6 @@ class GeminiService:
         operation: str = "generate",
         temperature: float = 0.1,
     ) -> dict[str, Any]:
-        """Один вызов модели, ответ — разобранный JSON.
-
-        Поднимает ``GeminiError``, если ключа нет, вызов не прошёл или ответ
-        не удалось разобрать. Молча возвращать пустоту нельзя: наверху это
-        станет «изделие не распознано», и владелец решит, что виновато фото.
-        """
         settings = self._settings
         if not settings.gemini_enabled:
             raise GeminiError("GEMINI_API_KEY не задан")
@@ -135,9 +263,6 @@ class GeminiService:
         if schema is not None:
             body["generationConfig"]["responseSchema"] = schema
 
-        # Цена известна только по ответу — считается по usageMetadata и
-        # пишется той же строкой api_calls, что и сам вызов. Потолок на
-        # заявку проверяет такой вызов по уже потраченному.
         result = await self._client.post(
             f"/models/{model_name}:generateContent",
             operation=f"{operation}:{model_name}",
@@ -171,29 +296,15 @@ class GeminiService:
         return parsed
 
     def load_instruction(self, name: str) -> str:
-        """Системная инструкция из ``prompts/<name>.md``.
-
-        Файл читается с диска при каждом вызове: владелец правит инструкцию
-        и видит результат без перезапуска бота. В коде инструкций нет —
-        это правило проекта.
-        """
         path = Path(self._settings.prompts_dir) / f"{name}.md"
         try:
             return path.read_text(encoding="utf-8")
         except FileNotFoundError as exc:
             raise GeminiError(f"нет файла инструкции {path}") from exc
 
-    # --- Разбор входа владельца ------------------------------------------
-
     async def parse_text(self, text: str, *, request_id: int | None = None) -> ProductRequest:
-        parsed = await self.generate_json(
-            parts=[Part(text=f"Запрос закупщика:\n{text}")],
-            system_instruction=self.load_instruction("product"),
-            schema=PRODUCT_SCHEMA,
-            request_id=request_id,
-            operation="intake.text",
-        )
-        return _to_product_request(parsed, raw_input=text)
+        # Обычный текст не тратит Gemini. Это основной бесплатный путь.
+        return _parse_text_locally(text)
 
     async def parse_photo(
         self, image: bytes, mime_type: str = "image/jpeg", *, request_id: int | None = None
@@ -248,7 +359,6 @@ class GeminiService:
     async def transcribe(
         self, audio: bytes, mime_type: str = "audio/ogg", *, request_id: int | None = None
     ) -> str:
-        """Только расшифровка, без разбора смысла (этап 6)."""
         parsed = await self.generate_json(
             parts=[
                 Part(text="Расшифруй это голосовое сообщение дословно, по-русски."),
@@ -276,15 +386,13 @@ class GeminiService:
         operation: str | None = None,
         untrusted: bool = True,
     ) -> dict[str, Any]:
-        """Прогнать промпт из ``prompts/<name>.md`` над готовым JSON.
+        # Два частых шага выполняются локально: это сохраняет бесплатную
+        # суточную квоту для фото, голоса и документов.
+        if prompt_name == "report":
+            return _local_rank(payload)
+        if prompt_name == "email":
+            return _local_email(payload)
 
-        По умолчанию JSON уходит в модель в явной рамке «это данные, не
-        инструкции»: почти в каждом промпте есть текст из чужих рук —
-        названия компаний, придуманные моделью поиска по чужим страницам,
-        адреса, цитаты с сайтов. Поля владельца от рамки не страдают, а
-        забыть флаг у нового промпта теперь нельзя. ``untrusted=False`` —
-        только для промптов, где чужого текста нет вовсе.
-        """
         instruction = self.load_instruction(prompt_name)
         body = json.dumps(payload, ensure_ascii=False, indent=2)
         if untrusted:
@@ -303,7 +411,6 @@ class GeminiService:
 
 
 def usage_from_payload(payload: Any, model_name: str) -> Usage:
-    """Токены и цена вызова из ``usageMetadata`` ответа Gemini."""
     meta = (payload or {}).get("usageMetadata", {}) if isinstance(payload, dict) else {}
     tokens_in = int(meta.get("promptTokenCount", 0) or 0)
     tokens_out = int(meta.get("candidatesTokenCount", 0) or 0)

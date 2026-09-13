@@ -12,13 +12,14 @@ from aiogram.enums import ParseMode
 from bot import texts
 from bot.config import get_settings
 from bot.db.session import dispose_engine
-from bot.handlers import admin, batch_actions, diagnostics, errors, intake, selection, single_rfq_actions
+from bot.handlers import ai_chat, admin, batch_actions, diagnostics, errors, intake, selection, single_rfq_actions
 from bot.logging_setup import setup_logging
 from bot.middleware import OwnerOnlyMiddleware, ThrottleMiddleware
 from bot.scheduler import start_background_tasks, stop_background_tasks
 from bot.services import guard
 from bot.services.batch_registry_policy import install_batch_registry_policy
 from bot.services.batch_supplier_policy import install_batch_supplier_policy
+from bot.services.chat import close_chat_service
 from bot.services.direct_web_policy import install_direct_web_policy
 from bot.services.firecrawl import close_firecrawl_service
 from bot.services.gemini import close_gemini_service
@@ -51,6 +52,9 @@ def build_dispatcher() -> Dispatcher:
     dispatcher.include_router(selection.router)
     dispatcher.include_router(single_rfq_actions.router)
     dispatcher.include_router(batch_actions.router)
+    # AI-чат должен стоять перед intake: когда /chat включён, обычный текст
+    # перехватывает языковая модель, а не закупочный конвейер.
+    dispatcher.include_router(ai_chat.router)
     dispatcher.include_router(intake.router)
     return dispatcher
 
@@ -94,6 +98,7 @@ async def main() -> None:
         logger.info("Останавливаюсь")
         await stop_background_tasks(tasks)
         await close_registry_service()
+        await close_chat_service()
         await close_gemini_service()
         await close_perplexity_service()
         await close_firecrawl_service()

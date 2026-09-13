@@ -1,8 +1,10 @@
-"""Policy layer for multi-item procurement reports.
+"""Policy layer for procurement reports.
 
-The registry may legitimately find equivalent products under another RU. Those
-alternatives are useful to show, but they must not become the primary
-manufacturer for a batch whose confirmed RU holder is someone else.
+Verified RU holder remains the strongest manufacturer evidence. When RU is not
+confirmed, however, procurement must still work: an explicitly discovered
+manufacturer may be treated as the manufacturer channel, but never as a
+verified RU holder. This keeps missing RU from flattening every supplier into
+"прочий поставщик".
 """
 from __future__ import annotations
 
@@ -39,7 +41,7 @@ def _supplier_matches_holder(row: Any) -> bool:
 
 
 def install_batch_supplier_policy() -> None:
-    """Install strict primary-RU semantics without changing DB schema."""
+    """Install strict primary-RU semantics while allowing unverified-RU procurement."""
     global _INSTALLED
     if _INSTALLED:
         return
@@ -50,33 +52,35 @@ def install_batch_supplier_policy() -> None:
 
     def batch_role(row: Any) -> str:
         role = original_batch_role(row)
-        # Search engines can call a company "manufacturer" because it makes an
-        # equivalent product under another RU. In the PRIMARY branch this is
-        # only manufacturer when its identity matches the confirmed RU holder.
-        if role == "manufacturer" and not _supplier_matches_holder(row):
+        holder = str(getattr(row, "ru_holder", "") or "").strip()
+        # With a confirmed holder, another company's discovery label must not
+        # override the RU branch. Without a confirmed holder, an explicit
+        # manufacturer discovery is useful commercial evidence and is kept.
+        if role == "manufacturer" and holder and not _supplier_matches_holder(row):
             return "seller"
         return role
 
     procurement_batch._role = batch_role
 
     def strict_holder_or_manufacturer(view: Any) -> bool:
-        # Never trust the discovery label alone. Manufacturer priority is tied
-        # to the RU holder confirmed for the selected product line.
         holder_terms = _org_terms(getattr(view, "ru_holder", None))
-        if not holder_terms:
-            return False
-        haystack = f"{getattr(view, 'supplier_name', '')} {getattr(view, 'domain', '') or ''}".lower()
-        return any(term in haystack for term in holder_terms)
+        if holder_terms:
+            haystack = f"{getattr(view, 'supplier_name', '')} {getattr(view, 'domain', '') or ''}".lower()
+            return any(term in haystack for term in holder_terms)
+        # RU is not verified: do not call anyone a holder, but preserve an
+        # independently discovered manufacturer role for procurement ranking.
+        return str(getattr(view, "supplier_role", "") or "") == "manufacturer"
 
     report._is_holder_or_manufacturer = strict_holder_or_manufacturer
 
     # Reduce Firecrawl pressure: batch search has several item passes and the
-    # old 24-sites-per-item ceiling quickly hit the 15 req/min plan limit.
+    # old 24-sites-per-item ceiling quickly hit the request-rate limit.
     from bot import pipeline
     pipeline.MAX_SITES_TO_SCRAPE = min(int(getattr(pipeline, "MAX_SITES_TO_SCRAPE", 24)), 8)
 
     texts.REPORT_FOOTER = (
-        "Выберите основной канал закупки. Альтернативные производители под другим РУ "
-        "не подменяют подтверждённую товарную линию."
+        "На этом этапе основной поставщик ещё не выбирается. Запросите КП у производителя/"
+        "основного канала и 1–2 сильных альтернатив, затем сравните цену, наличие, срок поставки "
+        "и подтверждение РУ."
     )
     _INSTALLED = True

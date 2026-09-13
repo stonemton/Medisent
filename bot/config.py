@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     relaymodels_transcribe_model: str = "gpt-4o-transcribe"
     llm_report_model: str = "gemini-3.8-flash"
     llm_email_model: str = "gemini-3.8-flash"
+    # Центральный агент/арбитр. Можно независимо переключить на Claude через Railway.
+    llm_agent_model: str = "gemini-3.8-flash"
 
     # --- Поиск и скрейпинг ----------------------------------------------
     perplexity_api_key: str = ""

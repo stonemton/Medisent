@@ -56,6 +56,7 @@ class ScrapeResult:
     markdown: str = ""
     error: str | None = None
     injection_suspected: bool = False
+    evidence_url: str | None = None
 
 
 def _extract_price(text: str) -> Decimal | None:
@@ -101,6 +102,15 @@ def _product_terms(product: str) -> list[str]:
             seen.add(token)
             terms.append(token)
     return terms
+
+
+def _has_product_signal(product: str, text: str) -> bool:
+    lowered = (text or "").lower()
+    terms = _product_terms(product)
+    exact = [t for t in terms if any(ch.isdigit() for ch in t)]
+    if exact:
+        return any(t in lowered for t in exact)
+    return bool(terms and any(t in lowered for t in terms))
 
 
 def _site_domain(url: str) -> str:
@@ -165,6 +175,7 @@ class FirecrawlService:
             phone=(m.group(0) if (m := PHONE_RE.search(markdown)) else None),
             markdown=markdown,
             injection_suspected=screening.suspicious,
+            evidence_url=url,
         )
 
     async def search_site(
@@ -175,11 +186,7 @@ class FirecrawlService:
         request_id: int | None = None,
         limit: int = 5,
     ) -> ScrapeResult | None:
-        """Найти внутри одного домена наиболее релевантную страницу товара.
-
-        Используется только как fallback, когда исходная ссылка поставщика не содержит
-        точного товара. Это позволяет находить карточки, спрятанные глубже каталога.
-        """
+        """Найти внутри одного домена наиболее релевантную страницу товара."""
         if not self._settings.scrape_enabled:
             return None
         domain = _site_domain(site_url)
@@ -223,8 +230,6 @@ class FirecrawlService:
                 best_score, best_url, best_text = score, url, text
         if not best_url or best_score <= 0:
             return None
-        # Search API может вернуть уже извлечённый markdown, но повторный scrape даёт
-        # единый формат, контакты, цену, наличие и защиту от prompt injection.
         scraped = await self.scrape(best_url, product, request_id=request_id)
         if scraped.ok:
             return scraped
@@ -239,14 +244,38 @@ class FirecrawlService:
                 phone=(m.group(0) if (m := PHONE_RE.search(best_text)) else None),
                 markdown=best_text,
                 injection_suspected=screening.suspicious,
+                evidence_url=best_url,
             )
         return None
+
+    async def _scrape_with_site_fallback(
+        self, url: str, product: str, *, request_id: int | None = None
+    ) -> ScrapeResult:
+        primary = await self.scrape(url, product, request_id=request_id)
+        if primary.ok and _has_product_signal(product, primary.markdown):
+            return primary
+        found = await self.search_site(url, product, request_id=request_id)
+        if found and found.ok and _has_product_signal(product, found.markdown):
+            # ``url`` остаётся исходным ключом для pipeline, а evidence_url хранит
+            # прямую карточку/прайс, где действительно найден товар.
+            return ScrapeResult(
+                url=url,
+                ok=True,
+                claims_stock=found.claims_stock,
+                price=found.price,
+                email=found.email or primary.email,
+                phone=found.phone or primary.phone,
+                markdown=found.markdown,
+                injection_suspected=found.injection_suspected or primary.injection_suspected,
+                evidence_url=found.evidence_url or found.url,
+            )
+        return primary
 
     async def scrape_many(self, urls: list[str], product: str, *, request_id: int | None = None) -> list[ScrapeResult]:
         if not urls:
             return []
         results = await asyncio.gather(
-            *(self.scrape(url, product, request_id=request_id) for url in urls),
+            *(self._scrape_with_site_fallback(url, product, request_id=request_id) for url in urls),
             return_exceptions=True,
         )
         out: list[ScrapeResult] = []

@@ -52,6 +52,36 @@ def _batch_keyboard(request_id: int) -> InlineKeyboardBuilder:
     return builder
 
 
+def _registry_alternatives(record: object) -> list[dict[str, object]]:
+    raw = getattr(record, "raw", None)
+    if not isinstance(raw, dict):
+        return []
+    value = raw.get("registry_alternatives")
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _alternate_ru_lines(record: object, *, indent: str = "") -> list[str]:
+    alternatives = _registry_alternatives(record)
+    if not alternatives:
+        return []
+    lines = [
+        f"{indent}ℹ️ Также найдено совпадающее/близкое изделие под другим РУ:"
+    ]
+    for item in alternatives[:5]:
+        ru_number = texts.esc(str(item.get("ru_number") or "—"))
+        holder = texts.esc(str(item.get("holder") or "держатель не указан"))
+        status = item.get("valid")
+        status_text = "действует" if status is True else (
+            "не действует" if status is False else "статус не определён"
+        )
+        lines.append(
+            f"{indent}↳ <b>{ru_number}</b> · {status_text} · {holder}"
+        )
+    return lines
+
+
 async def _send_chunks(message: Message, lines: list[str], *, parse_mode: str | None = None) -> None:
     chunk = ""
     for line in lines:
@@ -125,7 +155,7 @@ async def _start_pipeline(message: Message, parsed: ProductRequest, input_kind: 
     registry = await get_registry_service().check_product(
         parsed.product,
         request_id=request_id,
-        cache=True,
+        cache=False,
     )
     best = registry.best
     if best is None:
@@ -137,15 +167,24 @@ async def _start_pipeline(message: Message, parsed: ProductRequest, input_kind: 
     status = "действует" if best.valid is True else (
         "не действует" if best.valid is False else "статус не определён"
     )
-    text = (
-        f"<b>Нашёл зарегистрированное изделие</b>\n\n"
-        f"Наименование по РУ: <b>{texts.esc(best.product_name or parsed.product)}</b>\n"
-        f"РУ: <b>{texts.esc(best.ru_number or '—')}</b> · {status}\n"
-        f"Держатель РУ / производитель: <b>{texts.esc(best.holder or 'не указан')}</b>\n\n"
-        "Это то изделие, которое нужно искать у поставщиков?"
-    )
+    parts = [
+        "<b>Нашёл зарегистрированное изделие</b>",
+        "",
+        f"Наименование по РУ: <b>{texts.esc(best.product_name or parsed.product)}</b>",
+        f"РУ: <b>{texts.esc(best.ru_number or '—')}</b> · {status}",
+        f"Держатель РУ / производитель: <b>{texts.esc(best.holder or 'не указан')}</b>",
+    ]
+    alternatives = _alternate_ru_lines(best)
+    if alternatives:
+        parts.extend(["", *alternatives])
+    parts.extend([
+        "",
+        "Основным считаю РУ выше. Изделия под другим РУ показываю только как альтернативные совпадения — не смешиваю производителей автоматически.",
+        "",
+        "Это то изделие, которое нужно искать у поставщиков?",
+    ])
     await message.answer(
-        text,
+        "\n".join(parts),
         parse_mode="HTML",
         reply_markup=_product_keyboard(request_id).as_markup(),
     )
@@ -198,7 +237,7 @@ async def _start_batch(message: Message, batch: ProcurementBatch, input_kind: st
     service = get_registry_service()
     checks = await asyncio.gather(
         *[
-            service.check_product(item.product, request_id=request_id, cache=True)
+            service.check_product(item.product, request_id=request_id, cache=False)
             for item in items
         ]
     )
@@ -219,6 +258,7 @@ async def _start_batch(message: Message, batch: ProcurementBatch, input_kind: st
             f"   РУ: <b>{texts.esc(best.ru_number or '—')}</b> · {status}\n"
             f"   Держатель: {texts.esc(best.holder or 'не указан')}"
         )
+        lines.extend(_alternate_ru_lines(best, indent="   "))
     await _send_chunks(message, lines, parse_mode="HTML")
 
     if unresolved:
@@ -231,7 +271,8 @@ async def _start_batch(message: Message, batch: ProcurementBatch, input_kind: st
         return
 
     await message.answer(
-        "Все позиции идентифицированы. Искать производителя и поставщиков сразу по всему списку?",
+        "Все позиции идентифицированы. Если найдены совпадающие изделия под другими РУ, они показаны выше как альтернативы и не подменяют основной выбор. "
+        "Искать производителя и поставщиков сразу по всему списку?",
         reply_markup=_batch_keyboard(request_id).as_markup(),
     )
 

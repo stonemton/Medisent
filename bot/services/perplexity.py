@@ -1,9 +1,9 @@
 """Поиск поставщиков через Perplexity Agent API.
 
-Search v4: исследовательский цикл. Сначала несколько независимых поисковых раундов
-по изделию, модели, РУ и держателю; затем при слабой выдаче — уточняющий поиск с
-учётом уже найденных доменов. Любой результат остаётся кандидатом до проверки
-страницы Firecrawl и Supplier Gate в pipeline.
+Коммерческий этап запускается после подтверждения изделия пользователем. Поиск
+восстанавливает цепочку производитель/держатель -> официальный дистрибьютор ->
+прочие продавцы. Официальность дистрибьютора принимается только при наличии
+явного источника-доказательства.
 """
 
 from __future__ import annotations
@@ -32,6 +32,13 @@ MAX_CITATION_CANDIDATES = 16
 MIN_MODEL_SUPPLIERS_BEFORE_STOP = 5
 MIN_TOTAL_CANDIDATES_BEFORE_STOP = 8
 
+ROLE_PRIORITY = {
+    "manufacturer": 0,
+    "official_distributor": 1,
+    "seller": 2,
+    "candidate": 3,
+}
+
 NON_SUPPLIER_DOMAINS = frozenset({
     "wikipedia.org", "ru.wikipedia.org", "youtube.com", "vk.com", "ok.ru",
     "t.me", "telegram.me", "facebook.com", "instagram.com", "twitter.com", "x.com",
@@ -39,18 +46,25 @@ NON_SUPPLIER_DOMAINS = frozenset({
     "made-in-china.com", "ru.made-in-china.com", "moy-zakupki.ru",
     "rusprofile.ru", "list-org.com", "zachestnyibiznes.ru", "sbis.ru",
     "roszdravnadzor.gov.ru", "zakupki.gov.ru", "consultant.ru", "garant.ru",
+    "nevacert.ru",
 })
 
 SUPPLIERS_SCHEMA_HINT = """Формат ответа (только JSON):
-{"suppliers":[{"name":"...","site":"https://...","email":"...","phone":"...","note":"почему релевантен и какое доказательство найдено"}]}
-В suppliers включай производителей, официальных дистрибьюторов и вероятных российских
-продавцов именно этого изделия. Для каждого кандидата ищи фактическую связь с товаром:
-точную модель/артикул, бренд, номер РУ, карточку товара, прайс, каталог производителя,
-страницу дилера или коммерческий контакт. Не включай маркетплейсы, каталоги общего
-назначения, реестры, справочники и госзакупки как поставщиков. Такие страницы можно
-использовать только как след для поиска настоящего сайта компании.
-Если связь вероятна, но не доказана, можешь включить компанию и явно написать это в note:
-страница будет отдельно проверена Firecrawl. Ничего не выдумывай."""
+{"suppliers":[{"name":"...","site":"https://...","email":"...","phone":"...","role":"manufacturer|official_distributor|seller|candidate","role_evidence_url":"https://...","role_evidence":"...","note":"..."}]}
+
+Правила role:
+- manufacturer: держатель РУ/производитель подтвержденного пользователем изделия.
+- official_distributor: только если есть отдельное доказательство официальности. Это должна быть
+  страница производителя/держателя со списком партнеров/дилеров/дистрибьюторов/«где купить»,
+  прямая ссылка производителя на компанию либо явная страница/документ компании о статусе
+  официального дистрибьютора/дилера именно данного производителя/бренда.
+- seller: реальный коммерческий продавец товара/бренда, но официальность не доказана.
+- candidate: только поисковый след, требующий проверки.
+
+Для official_distributor обязательно заполни role_evidence_url и role_evidence. Карточка товара,
+само слово «дистрибьютор» в общем описании компании и поисковый сниппет не подтверждают
+официальность. Не включай реестры, сертификационные/аналитические сайты, справочники,
+маркетплейсы и госзакупки как поставщиков. Ничего не выдумывай."""
 
 
 @dataclass(slots=True)
@@ -61,6 +75,9 @@ class FoundSupplier:
     phone: str = ""
     note: str = ""
     source_url: str = ""
+    role: str = "candidate"
+    role_evidence_url: str = ""
+    role_evidence: str = ""
 
 
 @dataclass(slots=True)
@@ -144,11 +161,16 @@ def _merge_suppliers(groups: list[list[FoundSupplier]]) -> list[FoundSupplier]:
                 old.note = "; ".join(x for x in (old.note, supplier.note) if x)
             if not old.source_url and supplier.source_url:
                 old.source_url = supplier.source_url
+            if ROLE_PRIORITY.get(supplier.role, 3) < ROLE_PRIORITY.get(old.role, 3):
+                old.role = supplier.role
+            if not old.role_evidence_url and supplier.role_evidence_url:
+                old.role_evidence_url = supplier.role_evidence_url
+            if not old.role_evidence and supplier.role_evidence:
+                old.role_evidence = supplier.role_evidence
     return [merged[key] for key in order]
 
 
 def _citation_candidates(citations: list[str], known: list[FoundSupplier]) -> list[FoundSupplier]:
-    """Citation — только сырой кандидат. Подтверждение делает Firecrawl/pipeline."""
     seen = {domain_of(x.site) for x in known if x.site}
     out: list[FoundSupplier] = []
     for url in citations:
@@ -163,6 +185,7 @@ def _citation_candidates(citations: list[str], known: list[FoundSupplier]) -> li
             site=url,
             note="поисковый источник; требует проверки страницы товара",
             source_url=url,
+            role="candidate",
         ))
         if len(out) >= MAX_CITATION_CANDIDATES:
             break
@@ -170,11 +193,6 @@ def _citation_candidates(citations: list[str], known: list[FoundSupplier]) -> li
 
 
 def _product_identifiers(product: str) -> list[str]:
-    """Достаёт артикулы/модели для отдельных точных поисков.
-
-    Идентификатором считаем токен с цифрой и буквой/дефисом, например QPWB-35N,
-    MPK165P.3 или 0301-01M. Чистые годы и количества не используем.
-    """
     found: list[str] = []
     seen: set[str] = set()
     for raw in re.findall(r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9._/-]{2,}", product):
@@ -200,24 +218,25 @@ def _initial_queries(
     holder: str | None,
 ) -> list[tuple[str, str]]:
     extras = f" Требования: {'; '.join(requirements)}." if requirements else ""
-    holder_hint = f" Держатель РУ: {holder}." if holder else ""
+    holder_hint = f" Держатель/производитель подтвержденного изделия: {holder}." if holder else ""
     queries: list[tuple[str, str]] = [
         (
             "official",
-            f'Исследуй российский рынок по изделию "{product}". Найди производителя, '
-            f'официальный сайт, держателя РУ, официальных дилеров и дистрибьюторов. '
-            f'Для каждой компании найди прямое доказательство связи с изделием.{holder_hint}{extras}',
+            f'Для изделия "{product}" найди официальный сайт производителя/держателя, затем '
+            f'на его сайте разделы партнеров, дилеров, дистрибьюторов и «где купить». Для каждого '
+            f'официального партнера дай URL, который подтверждает статус.{holder_hint}{extras}',
         ),
         (
             "commercial",
-            f'Найди в России реальные страницы продажи или поставки "{product}": карточки товара, '
-            f'прайсы, каталоги дилеров, страницы "запросить цену", коммерческие контакты. '
-            f'Не используй маркетплейсы, реестры и госзакупки как поставщиков.{extras}',
+            f'Найди реальные российские страницы продажи "{product}": точную модель/артикул, '
+            f'карточки, прайсы, каталоги, наличие, запрос цены. Отделяй обычных продавцов от '
+            f'официальных партнеров.{extras}',
         ),
         (
-            "exact",
-            f'Точный веб-поиск по "{product}": поставщик OR продавец OR дилер OR дистрибьютор OR '
-            f'производитель OR "запросить цену" Россия.{holder_hint}',
+            "partners",
+            f'Ищи официальных дистрибьюторов и дилеров производителя/бренда изделия "{product}". '
+            f'Официальность подтверждай первоисточником производителя либо явной страницей/документом '
+            f'партнера. Без доказательства ставь роль seller или candidate.{holder_hint}',
         ),
     ]
     identifiers = _product_identifiers(product)
@@ -225,23 +244,14 @@ def _initial_queries(
         quoted = " ".join(f'"{x}"' for x in identifiers)
         queries.append((
             "identifier",
-            f'Найди российские сайты, где встречаются точные модель/артикул {quoted}. '
-            f'Ищи производителя, дилеров, дистрибьюторов, карточки товара и прайсы. '
-            f'Сопоставь найденное именно с изделием "{product}".',
-        ))
-    if ru_number:
-        queries.append((
-            "ru",
-            f'По номеру РУ "{ru_number}" найди коммерческую цепочку изделия "{product}": '
-            f'держателя/производителя, официальный сайт, дилеров и продавцов в России. '
-            f'Сам реестр не считай поставщиком.{holder_hint}',
+            f'Найди продавцов точных моделей/артикулов {quoted} для изделия "{product}". '
+            f'Параллельно ищи партнерские списки производителя.',
         ))
     if holder:
         queries.append((
             "holder",
-            f'Исследуй компанию "{holder}" в связи с изделием "{product}". Найди её официальный '
-            f'сайт, продуктовую страницу, российских партнёров, дилеров и дистрибьюторов. '
-            f'Не делай вывод о продаже без источника.',
+            f'Исследуй официальный сайт компании "{holder}": контакты отдела продаж, страницы товара '
+            f'"{product}", разделы дилеры/дистрибьюторы/партнеры/где купить и сайты перечисленных там компаний.',
         ))
     return queries[:MAX_SEARCH_PASSES]
 
@@ -255,22 +265,10 @@ def _refinement_query(
 ) -> str:
     domains = [domain_of(x.site) for x in known if x.site]
     excluded = ", ".join(x for x in domains[:12] if x)
-    context: list[str] = []
-    if ru_number:
-        context.append(f"РУ {ru_number}")
-    if holder:
-        context.append(f"держатель {holder}")
-    identifiers = _product_identifiers(product)
-    if identifiers:
-        context.append("модель/артикул " + ", ".join(identifiers))
-    context_text = "; ".join(context) or "точное название изделия"
-    exclude_text = f" Уже найдены домены: {excluded}. Не повторяй их." if excluded else ""
     return (
-        f'Сделай второй исследовательский проход по изделию "{product}". Используй как опорные '
-        f'признаки: {context_text}. Ищи альтернативных российских поставщиков через страницы '
-        f'производителя, списки официальных партнёров, каталоги дилеров, точные артикулы, прайсы '
-        f'и страницы товара. Перепроверяй, что компания действительно связана с этим изделием.'
-        f'{exclude_text}'
+        f'Сделай второй проход по изделию "{product}". Найди новых реальных продавцов и особенно '
+        f'официальных партнеров производителя {holder or ""}. Проверяй официальный статус по '
+        f'первоисточнику. Уже найдены домены: {excluded}. Не повторяй их.'
     )
 
 
@@ -396,15 +394,6 @@ class PerplexityService:
         all_queries = [q for _, q in queries]
         if refinement_query:
             all_queries.append(refinement_query)
-        logger.info(
-            "Perplexity Search v4: «%s», модельных %s, citation-кандидатов %s, всего на проверку %s, refinement=%s",
-            product,
-            len(model_suppliers),
-            len(raw_candidates),
-            len(suppliers),
-            needs_refinement,
-            extra=log_extra(request_id),
-        )
         return SearchOutcome(
             suppliers=suppliers,
             citations=citations,
@@ -440,6 +429,14 @@ def _parse_suppliers(content: str) -> list[FoundSupplier]:
             continue
         seen.add(key)
         email = str(row.get("email") or "").strip()
+        role = str(row.get("role") or "candidate").strip().lower()
+        evidence_url = str(row.get("role_evidence_url") or "").strip()
+        evidence = str(row.get("role_evidence") or "").strip()
+        if role not in ROLE_PRIORITY:
+            role = "candidate"
+        # Нельзя повысить продавца до официального дистрибьютора без отдельного доказательства.
+        if role == "official_distributor" and (not evidence_url or not evidence):
+            role = "seller"
         suppliers.append(FoundSupplier(
             name=name,
             site=site,
@@ -447,6 +444,9 @@ def _parse_suppliers(content: str) -> list[FoundSupplier]:
             phone=str(row.get("phone") or "").strip(),
             note=str(row.get("note") or "").strip(),
             source_url=site,
+            role=role,
+            role_evidence_url=evidence_url,
+            role_evidence=evidence,
         ))
     return suppliers
 

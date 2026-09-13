@@ -1,8 +1,4 @@
-"""Конфигурация из окружения. Ключей в коде нет — только имена переменных.
-
-Отсутствие ключей Perplexity и Firecrawl запуску не мешает: это требование
-приёмки этапа 0. Бот пишет предупреждение в лог и продолжает работу.
-"""
+"""Конфигурация из окружения. Ключей в коде нет — только имена переменных."""
 
 from __future__ import annotations
 
@@ -35,17 +31,21 @@ class Settings(BaseSettings):
     # --- База -----------------------------------------------------------
     database_url: str
 
-    # --- Gemini ---------------------------------------------------------
+    # --- LLM / Gemini ---------------------------------------------------
+    # GEMINI_API_KEY оставлен для прямого Google Gemini.
     gemini_api_key: str = ""
-    llm_report_model: str = "gemini-flash-latest"
-    llm_email_model: str = "gemini-flash-latest"
+    # RelayModels — OpenAI-compatible шлюз. Если ключ задан, он имеет приоритет.
+    relaymodels_api_key: str = ""
+    relaymodels_base_url: str = "https://api.relaymodels.com/v1"
+    relaymodels_transcribe_model: str = "gpt-4o-transcribe"
+    llm_report_model: str = "gemini-3.8-flash"
+    llm_email_model: str = "gemini-3.8-flash"
 
     # --- Поиск и скрейпинг ----------------------------------------------
     perplexity_api_key: str = ""
     firecrawl_api_key: str = ""
 
     # --- Почта ----------------------------------------------------------
-    # Яндекс: IMAP 993 + SMTP submission 587/STARTTLS.
     yandex_email: str = ""
     yandex_app_password: str = ""
     imap_host: str = "imap.yandex.ru"
@@ -53,9 +53,6 @@ class Settings(BaseSettings):
     smtp_host: str = "smtp.yandex.ru"
     smtp_port: int = 587
     forward_to_email: str = ""
-
-    # Оставлено как совместимый псевдоним для существующего кода планировщика.
-    # После валидации сюда подставляется YANDEX_EMAIL.
     gmail_sender: str = ""
 
     # --- Реестры --------------------------------------------------------
@@ -83,7 +80,6 @@ class Settings(BaseSettings):
     @field_validator("database_url")
     @classmethod
     def _require_async_driver(cls, value: str) -> str:
-        """Приложение работает через asyncpg; синхронный URL молча не подставляем."""
         if value.startswith("postgresql://"):
             return value.replace("postgresql://", "postgresql+asyncpg://", 1)
         if not value.startswith("postgresql+asyncpg://"):
@@ -118,8 +114,12 @@ class Settings(BaseSettings):
         return bool(self.firecrawl_api_key)
 
     @property
+    def relaymodels_enabled(self) -> bool:
+        return bool(self.relaymodels_api_key)
+
+    @property
     def gemini_enabled(self) -> bool:
-        return bool(self.gemini_api_key)
+        return bool(self.relaymodels_api_key or self.gemini_api_key)
 
     @property
     def yandex_mail_enabled(self) -> bool:
@@ -138,7 +138,7 @@ class Settings(BaseSettings):
         warnings: list[str] = []
         if not self.gemini_enabled:
             warnings.append(
-                "GEMINI_API_KEY не задан — распознавание фото, голоса и файлов выключено"
+                "RELAYMODELS_API_KEY/GEMINI_API_KEY не задан — распознавание фото, голоса и файлов выключено"
             )
         if not self.search_enabled:
             warnings.append("PERPLEXITY_API_KEY не задан — поиск поставщиков выключен")

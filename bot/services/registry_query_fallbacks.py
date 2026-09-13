@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import Any
 
 from bot.logging_setup import log_extra
@@ -142,13 +143,18 @@ def _add_alternative(alternatives: list[dict[str, Any]], record: RegistryRecord)
         alternatives.append(payload)
 
 
-def _attach_alternatives(records: list[RegistryRecord], alternatives: list[dict[str, Any]]) -> None:
+def _attach_alternatives(
+    records: list[RegistryRecord], alternatives: list[dict[str, Any]]
+) -> list[RegistryRecord]:
+    """Возвращает новые frozen RegistryRecord с альтернативами в raw."""
     if not alternatives:
-        return
+        return records
+    attached: list[RegistryRecord] = []
     for record in records:
         raw = dict(record.raw) if isinstance(record.raw, dict) else {}
-        raw["registry_alternatives"] = alternatives
-        record.raw = raw
+        raw["registry_alternatives"] = [dict(item) for item in alternatives]
+        attached.append(replace(record, raw=raw))
+    return attached
 
 
 def install_registry_query_fallbacks() -> None:
@@ -215,7 +221,7 @@ def install_registry_query_fallbacks() -> None:
                 last_error = fallback_error
 
         if primary:
-            _attach_alternatives(primary, alternatives)
+            primary = _attach_alternatives(primary, alternatives)
             logger.info(
                 "ELK fallback: «%s» основной держатель подтверждён, РУ=%s; альтернативных РУ=%s",
                 name,

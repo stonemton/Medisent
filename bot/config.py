@@ -45,13 +45,13 @@ class Settings(BaseSettings):
     firecrawl_api_key: str = ""
 
     # --- Почта ----------------------------------------------------------
-    # Основной вариант для Railway: Яндекс Почта по IMAP/SMTP.
+    # Яндекс: IMAP 993 + SMTP submission 587/STARTTLS.
     yandex_email: str = ""
     yandex_app_password: str = ""
     imap_host: str = "imap.yandex.ru"
     imap_port: int = 993
     smtp_host: str = "smtp.yandex.ru"
-    smtp_port: int = 465
+    smtp_port: int = 587
     forward_to_email: str = ""
 
     # Оставлено как совместимый псевдоним для существующего кода планировщика.
@@ -68,9 +68,6 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_dir: str = "logs"
     daily_api_budget_usd: float = 5.0
-    # Жёсткий потолок на одну заявку. В отличие от дневного, этот не
-    # предупреждает, а перестаёт отправлять платные вызовы: одна заявка не
-    # должна съесть весь дневной бюджет.
     max_cost_per_request_usd: float = 0.5
     gmail_poll_seconds: int = 240
     http_timeout_connect: float = 10.0
@@ -104,17 +101,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _mail_aliases(self) -> "Settings":
-        # Старые модули используют gmail_sender; не заставляем менять их все
-        # одновременно при переходе на Яндекс.
         if self.yandex_email and not self.gmail_sender:
             self.gmail_sender = self.yandex_email
         return self
 
-    # --- Производные признаки -------------------------------------------
-
     @property
     def sync_database_url(self) -> str:
-        """URL для Alembic в offline-режиме: там asyncpg не работает."""
         return self.database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
 
     @property
@@ -140,11 +132,9 @@ class Settings(BaseSettings):
 
     @property
     def gmail_enabled(self) -> bool:
-        """Совместимый флаг: старый scheduler запускает почту по этому имени."""
         return self.yandex_mail_enabled
 
     def warn_about_missing_keys(self) -> list[str]:
-        """Возвращает список предупреждений и пишет их в лог. Запуск не прерывает."""
         warnings: list[str] = []
         if not self.gemini_enabled:
             warnings.append(

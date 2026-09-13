@@ -16,8 +16,7 @@ WORKDIR /app
 FROM base AS builder
 RUN python -m venv "$VIRTUAL_ENV"
 COPY requirements.txt .
-RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 
 FROM base AS runtime

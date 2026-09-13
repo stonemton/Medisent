@@ -3,7 +3,7 @@
 # сервисом не выносим (решение владельца по Railway, см. CLAUDE.md).
 # ---------------------------------------------------------------------------
 
-FROM python:3.12-slim AS base
+FROM python:3.12-slim-bookworm AS base
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \

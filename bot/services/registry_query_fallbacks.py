@@ -1,13 +1,14 @@
 """Точный fallback-поиск РУ для коротких закупочных наименований Цоликлонов.
 
-Вместо серии широких Firecrawl-поисков используем уже подтверждённые через
-официальные карточки ELK семейства РУ как поисковые подсказки, а затем всё
-равно валидируем карточку: нужный антиген должен присутствовать в полном
-тексте карточки, а основной матч должен принадлежать ООО «ГЕМАТОЛОГ».
+Для основной товарной линии используем подтверждённые карточки ELK ООО
+«ГЕМАТОЛОГ». Совпадающее изделие другого держателя сохраняем как альтернативу.
 
-Совпадающее изделие другого держателя сохраняется как альтернативное РУ.
-Точные RU-поиски дедуплицируются даже при параллельной обработке batch, чтобы
-A/B/D не запускали одинаковую проверку альтернативного РУ одновременно.
+Точные RU-поиски дедуплицируются даже при параллельной обработке batch. Для
+ФСР 2009/06043 дополнительно есть один дедуплицированный поиск по полному
+официальному семейству ООО «Медиклон»: ELK иногда возвращает по номеру РУ
+несколько нерелевантных карточек и текущий scraper не извлекает нужную запись.
+Альтернатива принимается только если карточка одновременно подтверждает номер
+РУ и держателя «Медиклон».
 """
 from __future__ import annotations
 
@@ -38,6 +39,10 @@ _SPACE_RE = re.compile(r"\s+")
 _GEMATOLOG_ABO_RU = "ФСР 2008/04007"
 _GEMATOLOG_RH_KELL_KIDD_RU = "ФСР 2012/12983"
 _MEDIKLON_ABO_RH_KELL_RU = "ФСР 2009/06043"
+_MEDIKLON_FAMILY_QUERY = (
+    "Набор реагентов для определения групп крови человека систем АВО, Резус и Kell "
+    "Цоликлоны 9398-101-51203590-2009"
+)
 
 
 def _compact_name(name: str) -> str:
@@ -85,6 +90,11 @@ def _holder_matches(record: RegistryRecord, expected: str) -> bool:
     holder = re.sub(r"[^a-zа-яё0-9]+", "", str(record.holder or "").lower())
     needle = re.sub(r"[^a-zа-яё0-9]+", "", expected.lower())
     return bool(holder and needle and needle in holder)
+
+
+def _ru_matches(record: RegistryRecord, expected: str) -> bool:
+    normalise = lambda value: re.sub(r"[^a-zа-яё0-9]+", "", str(value or "").lower())
+    return normalise(record.ru_number) == normalise(expected)
 
 
 def _alternative_payload(record: RegistryRecord) -> dict[str, Any]:
@@ -135,6 +145,8 @@ def install_registry_query_fallbacks() -> None:
 
     exact_cache: dict[str, tuple[list[RegistryRecord], str | None]] = {}
     exact_inflight: dict[str, asyncio.Task[tuple[list[RegistryRecord], str | None]]] = {}
+    family_cache: tuple[list[RegistryRecord], str | None] | None = None
+    family_inflight: asyncio.Task[tuple[list[RegistryRecord], str | None]] | None = None
 
     async def exact_ru(
         self: RegistryService, ru: str, request_id: int | None
@@ -155,6 +167,26 @@ def install_registry_query_fallbacks() -> None:
 
         if result[0]:
             exact_cache[ru] = result
+        return result
+
+    async def mediclone_family(
+        self: RegistryService, request_id: int | None
+    ) -> tuple[list[RegistryRecord], str | None]:
+        nonlocal family_cache, family_inflight
+        if family_cache is not None:
+            return family_cache
+        if family_inflight is None:
+            family_inflight = asyncio.create_task(
+                original_check(self, _MEDIKLON_FAMILY_QUERY, None, request_id)
+            )
+        task = family_inflight
+        try:
+            result = await task
+        finally:
+            if family_inflight is task and task.done():
+                family_inflight = None
+        if result[0]:
+            family_cache = result
         return result
 
     async def _check_elk_with_fallbacks(
@@ -183,8 +215,24 @@ def install_registry_query_fallbacks() -> None:
         ]
         alternatives = [
             record for record in alt_records
-            if not _holder_matches(record, "гематолог") and _antigen_matches(kind, record)
+            if _ru_matches(record, _MEDIKLON_ABO_RH_KELL_RU)
+            and _holder_matches(record, "медиклон")
+            and _antigen_matches(kind, record)
         ]
+
+        # ELK search by exact RU can return several unrelated card links. If the
+        # Mediclone card was not parsed, make one additional shared search by
+        # the official family/TU and still require exact RU + holder + antigen.
+        if not alternatives:
+            family_records, family_error = await mediclone_family(self, request_id)
+            alternatives = [
+                record for record in family_records
+                if _ru_matches(record, _MEDIKLON_ABO_RH_KELL_RU)
+                and _holder_matches(record, "медиклон")
+                and _antigen_matches(kind, record)
+            ]
+            if family_error and not alt_error:
+                alt_error = family_error
 
         if primary:
             primary = _attach_alternatives(primary, alternatives)

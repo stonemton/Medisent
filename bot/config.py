@@ -40,8 +40,10 @@ class Settings(BaseSettings):
     relaymodels_transcribe_model: str = "gpt-4o-transcribe"
     llm_report_model: str = "gemini-3.8-flash"
     llm_email_model: str = "gemini-3.8-flash"
-    # Центральный агент/арбитр. Можно независимо переключить на Claude через Railway.
+    # Одиночный агент/арбитр. Railway может переопределять это значение.
     llm_agent_model: str = "gemini-3.8-flash"
+    # Пакетный агент видит всю закупку одним запросом. По умолчанию — GPT через RelayModels.
+    llm_batch_agent_model: str = "gpt-5.6-sol"
 
     # --- Поиск и скрейпинг ----------------------------------------------
     perplexity_api_key: str = ""

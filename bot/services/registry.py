@@ -32,7 +32,12 @@ RU_NUMBER_RE = re.compile(
     re.I | re.UNICODE,
 )
 ORG_NAME_RE = re.compile(
-    r"\b(?:ООО|АО|ПАО|ОАО|ЗАО|НАО)\s*[«\"“]?[^\n;|]{2,120}?[»\"”]?(?=$|\n|;|\|)",
+    r"\b(?:"
+    r"ООО|АО|ПАО|ОАО|ЗАО|НАО|ИП|"
+    r"Общество\s+с\s+ограниченной\s+ответственностью|"
+    r"Акционерное\s+общество|Публичное\s+акционерное\s+общество|"
+    r"Индивидуальный\s+предприниматель"
+    r")\s*[«\"“]?[^\n;|]{2,180}?[»\"”]?(?=$|\n|;|\|)",
     re.I | re.UNICODE,
 )
 
@@ -122,16 +127,18 @@ def _record_matches_query(record: RegistryRecord, query: str) -> bool:
 def _clean_md_value(value: str | None) -> str | None:
     if not value:
         return None
-    value = re.sub(r"^[#>*_`\-\s]+|[#>*_`\s]+$", "", value).strip()
+    value = re.sub(r"^[#>*_`\-\s|]+|[#>*_`\s|]+$", "", value).strip()
     return value or None
 
 
 def _field_after_label(text: str, *labels: str) -> str | None:
+    """Берёт значение после подписи ELK, включая markdown-таблицы ``| label | value |``."""
     for label in labels:
         escaped = re.escape(label)
         patterns = (
             rf"(?im)^\s*(?:[#>*_`-]+\s*)?{escaped}\s*(?:[*_`]*)\s*$\n+\s*([^\n]+)",
             rf"(?im)^\s*(?:[#>*_`-]+\s*)?{escaped}\s*[:—-]\s*([^\n]+)",
+            rf"(?im)^\s*\|?\s*(?:[*_`]*){escaped}(?:[*_`]*)\s*\|\s*([^|\n]+)",
         )
         for pattern in patterns:
             match = re.search(pattern, text)
@@ -148,24 +155,25 @@ def _holder_from_context(text: str) -> str | None:
         "уполномоченн",
         "производител",
         "организац",
+        "юридическ",
+        "лицо, на имя которого",
+        "на имя которой выдан",
+        "на имя которого выдан",
         "регистрационное удостоверение выдано",
+        "сведения о лице",
     )
-    lines = [re.sub(r"\s+", " ", line).strip(" *_`#>-\t") for line in text.splitlines()]
+    lines = [re.sub(r"\s+", " ", line).strip(" *_`#>-\t|") for line in text.splitlines()]
     for index, line in enumerate(lines):
         if not line or not any(marker in line.lower() for marker in labels):
             continue
-        # Иногда значение стоит на той же строке после двоеточия.
         same = ORG_NAME_RE.search(line)
         if same:
             return _clean_md_value(same.group(0))
-        # В ELK значение обычно идёт следующей строкой/строками.
-        for candidate in lines[index + 1 : index + 5]:
+        for candidate in lines[index + 1 : index + 6]:
             found = ORG_NAME_RE.search(candidate)
             if found:
                 return _clean_md_value(found.group(0))
 
-    # Последний безопасный fallback: если на карточке вообще только одно
-    # российское юрлицо, оно гораздо надёжнее «держатель не указан».
     matches = []
     for found in ORG_NAME_RE.finditer(text):
         value = _clean_md_value(found.group(0))
@@ -200,10 +208,15 @@ def _parse_elk_card_text(text: str, url: str, query: str) -> RegistryRecord | No
         "Наименование организации, на имя которой выдано регистрационное удостоверение",
         "Наименование организации, на имя которой выдано РУ",
         "Юридическое лицо, на имя которого выдано регистрационное удостоверение",
+        "Наименование юридического лица, на имя которого выдано регистрационное удостоверение",
+        "Сведения о лице, на имя которого выдано регистрационное удостоверение",
+        "Лицо, на имя которого выдано регистрационное удостоверение",
         "Организация-заявитель",
         "Наименование заявителя",
         "Заявитель",
         "Держатель регистрационного удостоверения",
+        "Наименование производителя",
+        "Производитель медицинского изделия",
         "Производитель",
     )
     holder = holder or _holder_from_context(text)
@@ -336,9 +349,6 @@ class RegistryService:
                 continue
             seen_urls.add(url)
 
-            # Search отдаёт только короткий сниппет карточки (в нашем случае ~127
-            # символов). Поэтому после обнаружения официального URL всегда
-            # скрейпим саму карточку целиком и только её считаем источником РУ.
             full_text, scrape_error = await self._scrape_elk_card(url, request_id=request_id)
             if scrape_error:
                 errors.append(f"{url}: {scrape_error}")
